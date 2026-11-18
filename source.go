@@ -18,6 +18,9 @@ import (
 
 	"github.com/gomcpgo/govideo/codec"
 	"github.com/gomcpgo/govideo/codec/native"
+	"github.com/gomcpgo/govideo/codec/oscodec"
+	"github.com/gomcpgo/govideo/internal/codechdr"
+	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/wav"
@@ -31,6 +34,7 @@ const outRate = 48000 // programme audio sample rate (SPEC §7.4)
 type packet struct {
 	pts  time.Duration
 	data []byte
+	sync bool // a decoder can start here
 }
 
 type packetReader interface {
@@ -45,6 +49,7 @@ type media struct {
 	iso  *isobmff.File
 	mkv  *matroska.File
 	wv   *wav.File
+	avi  *avi.File
 }
 
 func openMedia(ctx context.Context, path string) (*media, error) {
@@ -71,6 +76,8 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		m.mkv, err = matroska.Open(ctx, f, st.Size())
 	case "wav":
 		m.wv, err = wav.Open(ctx, f, st.Size())
+	case "avi":
+		m.avi, err = avi.Open(ctx, f, st.Size())
 	default:
 		err = fmt.Errorf("unsupported container %q", m.info.Format)
 	}
@@ -111,7 +118,7 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 			if int64(t.ID) != s.ID {
 				continue
 			}
-			r := &isoReader{f: m.iso, it: t.Iter(), ts: int64(t.Timescale), pcm: pcmFrame > 0}
+			r := &isoReader{f: m.iso, tr: t, it: t.Iter(), ts: int64(t.Timescale), pcm: pcmFrame > 0}
 			if pcmFrame > 0 {
 				r.it.SetUniformSize(uint32(pcmFrame))
 			}
@@ -136,17 +143,65 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 				if t.Err != nil {
 					return nil, t.Err
 				}
-				return &mkvReader{pr: m.mkv.NewReaderContext(ctx), track: t.Number}, nil
+				return &mkvReader{pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
 			}
 		}
 	case m.wv != nil:
 		return &wavReader{f: m.f, w: m.wv}, nil
+	case m.avi != nil:
+		for _, t := range m.avi.Streams {
+			if int64(t.Index) == s.ID {
+				return &aviReader{f: m.avi, s: t}, nil
+			}
+		}
 	}
 	return nil, fmt.Errorf("govideo: %s: stream %d not found", m.path, s.Index)
 }
 
+// config returns the codec configuration of stream s: the named child box of
+// its MP4 sample entry, or the Matroska CodecPrivate.
+func (m *media) config(s *videoprobe.Stream, box string) []byte {
+	switch {
+	case m.iso != nil:
+		for _, t := range m.iso.Tracks {
+			if int64(t.ID) == s.ID && len(t.Entries) > 0 {
+				return t.Entries[0].Boxes[box]
+			}
+		}
+	case m.mkv != nil:
+		for _, t := range m.mkv.Tracks {
+			if int64(t.Number) == s.ID {
+				return t.CodecPrivate
+			}
+		}
+	}
+	return nil
+}
+
+// videoSpan returns how long the video stream s plays. Matroska records only
+// a file duration, which also covers audio that outlasts the picture, so
+// there the span is measured from the frame timestamps.
+func (m *media) videoSpan(s *videoprobe.Stream) time.Duration {
+	if m.mkv != nil {
+		for _, t := range m.mkv.Tracks {
+			if int64(t.Number) != s.ID || !t.HasTimestamps || t.LastTimestamp <= t.FirstTimestamp {
+				continue
+			}
+			span := t.LastTimestamp - t.FirstTimestamp
+			if r := s.Video.FrameRate.Float(); r > 0 {
+				span += time.Duration(1e9 / r)
+			} else if t.Frames > 1 {
+				span += span / time.Duration(t.Frames-1)
+			}
+			return min(span, s.Duration)
+		}
+	}
+	return s.Duration
+}
+
 type isoReader struct {
 	f          *isobmff.File
+	tr         *isobmff.Track
 	it         *isobmff.SampleIter
 	ts         int64
 	mediaStart int64
@@ -172,13 +227,43 @@ func (r *isoReader) next() (packet, error) {
 	if err != nil {
 		return packet{}, err
 	}
-	pts := s.PTS() - r.mediaStart
-	return packet{pts: r.shift + time.Duration(float64(pts)/float64(r.ts)*1e9), data: data}, nil
+	return packet{pts: r.time(s.PTS()), data: data, sync: s.Sync}, nil
+}
+
+// time converts a media time to a presentation time.
+func (r *isoReader) time(t int64) time.Duration {
+	return r.shift + time.Duration(float64(t-r.mediaStart)/float64(r.ts)*1e9)
+}
+
+// seekSync positions the reader on the last sync sample presented at or
+// before t, so a decoder need not start from the beginning of the file. It
+// must be called before the first next.
+func (r *isoReader) seekSync(t time.Duration) {
+	it := r.tr.Iter()
+	skip := 0
+	for i := 0; ; i++ {
+		s, err := it.Next()
+		if err != nil || r.time(s.DTS) > t {
+			break
+		}
+		if s.Sync && r.time(s.PTS()) <= t {
+			skip = i
+		}
+	}
+	for ; skip > 0; skip-- {
+		if _, err := r.it.Next(); err != nil {
+			return
+		}
+	}
 }
 
 type mkvReader struct {
 	pr    *matroska.PacketReader
 	track uint64
+	// delay is the track's CodecDelay: block timestamps are that much later
+	// than presentation time, so the encoder's priming samples land before
+	// time zero and are cut like any other leading audio.
+	delay time.Duration
 }
 
 func (r *mkvReader) next() (packet, error) {
@@ -188,9 +273,33 @@ func (r *mkvReader) next() (packet, error) {
 			return packet{}, err
 		}
 		if p.Track == r.track {
-			return packet{pts: p.Timestamp, data: p.Data}, nil
+			return packet{pts: p.Timestamp - r.delay, data: p.Data}, nil
 		}
 	}
+}
+
+// aviReader reads the chunks of one AVI stream.
+type aviReader struct {
+	f *avi.File
+	s *avi.Stream
+	i int
+}
+
+func (r *aviReader) next() (packet, error) {
+	for r.i < len(r.s.Chunks) {
+		i := r.i
+		r.i++
+		c := r.s.Chunks[i]
+		if c.Size == 0 {
+			continue // a dropped frame: the previous picture stays up
+		}
+		data, err := r.f.ReadChunk(c, nil)
+		if err != nil {
+			return packet{}, err
+		}
+		return packet{pts: r.s.ChunkTime(i), data: data, sync: true}, nil
+	}
+	return packet{}, io.EOF
 }
 
 type wavReader struct {
@@ -220,35 +329,53 @@ func (r *wavReader) next() (packet, error) {
 type audioStream struct {
 	rd      packetReader
 	dec     codec.AudioDecoder
-	rs      *process.Resampler
+	rs      *process.Resampler // created from the first decoded block
 	buf     []float32
 	skip    int64 // output frames still to drop (trim, negative start)
 	started bool
 	eof     bool
 }
 
-func audioDecoder(s *videoprobe.Stream) (codec.AudioDecoder, error) {
-	if _, err := Available(CodecID(s.Codec), Decode); err != nil {
+func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
+	ci, err := Available(CodecID(s.Codec), Decode)
+	if err != nil {
 		return nil, err
 	}
-	return native.NewPCMDecoder(s.Codec, s.Audio.Channels, s.Audio.SampleRate)
+	if ci.ID == "pcm" {
+		return native.NewPCMDecoder(s.Codec, s.Audio.Channels, s.Audio.SampleRate)
+	}
+	cfg := m.config(s, "esds")
+	if m.iso != nil {
+		if _, cfg, _, _, err = codechdr.ParseESDS(cfg); err != nil {
+			return nil, fmt.Errorf("govideo: %s audio configuration: %w", ci.ID, err)
+		}
+	}
+	return oscodec.NewAudioDecoder(oscodec.AudioConfig{Codec: string(ci.ID),
+		SampleRate: s.Audio.SampleRate, Channels: s.Audio.Channels, Config: cfg})
 }
 
 // openAudio starts reading stream s of m, positioned trim into the stream.
 func openAudio(ctx context.Context, m *media, s *videoprobe.Stream, trim time.Duration) (*audioStream, error) {
-	dec, err := audioDecoder(s)
+	dec, err := audioDecoder(m, s)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
 	rd, err := m.reader(ctx, s)
 	if err != nil {
+		closeDecoder(dec)
 		return nil, err
 	}
-	return &audioStream{
-		rd: rd, dec: dec, skip: durToFrames(trim),
-		rs: process.NewResampler(s.Audio.SampleRate, outRate, 2),
-	}, nil
+	return &audioStream{rd: rd, dec: dec, skip: durToFrames(trim)}, nil
 }
+
+// closeDecoder releases a decoder that holds operating-system resources.
+func closeDecoder(d any) {
+	if c, ok := d.(io.Closer); ok {
+		c.Close()
+	}
+}
+
+func (a *audioStream) close() { closeDecoder(a.dec) }
 
 func durToFrames(d time.Duration) int64 {
 	return int64(float64(d)/1e9*outRate + 0.5)
@@ -263,7 +390,9 @@ func (a *audioStream) read(dst []float32) (int, error) {
 		switch {
 		case err == io.EOF:
 			a.eof = true
-			out = a.rs.Flush()
+			if a.rs != nil {
+				out = a.rs.Flush()
+			}
 		case err != nil:
 			return 0, err
 		default:
@@ -286,6 +415,14 @@ func (a *audioStream) read(dst []float32) (int, error) {
 					a.skip += durToFrames(-p.pts)
 				}
 			}
+			if a.rs == nil {
+				// The decoder knows the real rate (it can differ from the
+				// container's for HE-AAC).
+				if fr.SampleRate < 1 || fr.Channels < 1 {
+					return 0, errors.New("govideo: audio decoder returned no format")
+				}
+				a.rs = process.NewResampler(fr.SampleRate, outRate, 2)
+			}
 			out = a.rs.Process(process.ToStereo(fr.Samples, fr.Channels))
 		}
 		if a.skip > 0 {
@@ -303,30 +440,80 @@ func (a *audioStream) read(dst []float32) (int, error) {
 
 // --- video -------------------------------------------------------------------
 
-// videoStream selects, for a rising sequence of times, the source frame to
-// show. Phase 0 decodes intra-only codecs, so packets are decoded lazily and
-// only when selected; inter-frame codecs will need a decode-order path with
-// reordering here.
-type videoStream struct {
-	rd        packetReader
-	dec       codec.VideoDecoder
-	rotation  int
-	cur, peek *packet
-	seq       int64
-	eof       bool
-	frame     *codec.VideoFrame
-	frameSeq  int64
+// reorderWindow is how many packets ahead of the decoder the stream reads.
+// A decoded frame is released once no packet in the window is presented
+// before it; H.264 and HEVC bound reordering to 16 frames.
+const reorderWindow = 17
+
+// vframe is a source picture, decoded (frame) or not yet (data).
+type vframe struct {
+	pts   time.Duration
+	data  []byte
+	frame *codec.VideoFrame
 }
 
-func openVideo(ctx context.Context, m *media, s *videoprobe.Stream) (*videoStream, error) {
-	if _, err := Available(CodecID(s.Codec), Decode); err != nil {
+// videoStream selects, for a rising sequence of times, the source frame to
+// show. Intra-only codecs are decoded lazily, only when a frame is selected.
+// Inter-frame codecs are decoded in full, in decode order, and the pictures
+// are put back into presentation order here.
+type videoStream struct {
+	rd       packetReader
+	intra    codec.VideoDecoder       // intra-only codecs
+	dec      codec.VideoStreamDecoder // inter-frame codecs
+	rotation int
+	start    time.Duration // first time that will be asked for
+	slack    time.Duration // how far past the asked time a frame may start
+
+	look    []packet           // read but not yet decoded
+	held    []codec.TimedFrame // decoded, waiting for their turn
+	flushed bool
+	eof     bool
+
+	cur, peek *vframe
+	seq       int64
+	shown     *codec.VideoFrame
+	shownSeq  int64
+}
+
+// openVideo starts reading stream s of m; the first frame asked for will be
+// the one shown at start. slack is the tolerance of frame selection (see
+// frameAt).
+func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack time.Duration) (*videoStream, error) {
+	ci, err := Available(CodecID(s.Codec), Decode)
+	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
 	rd, err := m.reader(ctx, s)
 	if err != nil {
 		return nil, err
 	}
-	return &videoStream{rd: rd, dec: native.MJPEGDecoder{}, rotation: s.Video.Rotation, frameSeq: -1}, nil
+	v := &videoStream{rd: rd, rotation: s.Video.Rotation, start: start, slack: slack, shownSeq: -1}
+	if ci.ID == "mjpeg" {
+		v.intra = native.MJPEGDecoder{}
+		return v, nil
+	}
+	box := map[CodecID]string{"h264": "avcC", "hevc": "hvcC"}[ci.ID]
+	// The display size, not the coded size: the decoder applies the
+	// bitstream's cropping and returns pictures of this size.
+	w, h := s.Video.Width, s.Video.Height
+	// The matrix comes from the stream's own signalling; the system decoder
+	// does not always pass it on with the pictures.
+	matrix := map[string]int{"bt709": 1, "bt470bg": 5, "smpte170m": 6, "smpte240m": 7, "bt2020nc": 9, "bt2020c": 10}[s.Video.ColorMatrix]
+	v.dec, err = oscodec.NewVideoDecoder(oscodec.VideoConfig{Codec: string(ci.ID), Width: w, Height: h,
+		Record: m.config(s, box), Matrix: matrix})
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", m.path, err)
+	}
+	if ir, ok := rd.(*isoReader); ok && start > 0 {
+		ir.seekSync(start)
+	}
+	return v, nil
+}
+
+func (v *videoStream) close() {
+	if v.dec != nil {
+		v.dec.Close()
+	}
 }
 
 func (v *videoStream) pull() (*packet, error) {
@@ -344,13 +531,90 @@ func (v *videoStream) pull() (*packet, error) {
 	return &p, nil
 }
 
-// frameAt returns the frame presented at time t and a sequence number that
-// changes whenever the picture does. t must not decrease between calls.
+// next returns the following frame in presentation order, or nil at the end.
+func (v *videoStream) next() (*vframe, error) {
+	if v.intra != nil {
+		p, err := v.pull()
+		if p == nil {
+			return nil, err
+		}
+		return &vframe{pts: p.pts, data: p.data}, nil
+	}
+	for {
+		for !v.eof && len(v.look) < reorderWindow {
+			p, err := v.pull()
+			if err != nil {
+				return nil, err
+			}
+			if p != nil {
+				v.look = append(v.look, *p)
+			}
+		}
+		if len(v.held) > 0 {
+			first := 0
+			for i, f := range v.held {
+				if f.PTS < v.held[first].PTS {
+					first = i
+				}
+			}
+			ready := v.flushed
+			if !ready && len(v.look) > 0 {
+				ready = true
+				for _, p := range v.look {
+					if p.pts < v.held[first].PTS {
+						ready = false
+						break
+					}
+				}
+			}
+			if ready {
+				f := v.held[first]
+				v.held = append(v.held[:first], v.held[first+1:]...)
+				return &vframe{pts: f.PTS, frame: f.Frame}, nil
+			}
+		}
+		var (
+			frames []codec.TimedFrame
+			err    error
+		)
+		switch {
+		case len(v.look) > 0:
+			p := v.look[0]
+			v.look = v.look[1:]
+			frames, err = v.dec.Decode(p.data, p.pts)
+			if err != nil && p.pts < v.start {
+				// Pictures before the start are only decoded as references.
+				// After a seek some of them refer to the previous group of
+				// pictures and cannot be decoded; they are not needed.
+				err = nil
+			}
+		case !v.flushed:
+			frames, err = v.dec.Flush()
+			v.flushed = true
+		default:
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		v.held = append(v.held, frames...)
+	}
+}
+
+// frameAt returns the frame to show for the output frame that starts at time
+// t, and a sequence number that changes whenever the picture does. t must
+// not decrease between calls.
+//
+// The frame chosen is the last one that starts no later than t+slack. With
+// slack a little under half an output frame, that is the source frame on
+// screen for most of the output frame, and the choice is stable against
+// timestamp rounding (Matroska stores whole milliseconds) and against
+// sources whose frames sit at a constant offset from the output grid.
 func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error) {
-	const eps = 50 * time.Microsecond
+	eps := max(v.slack, 50*time.Microsecond)
 	var err error
 	if v.cur == nil {
-		if v.cur, err = v.pull(); err != nil {
+		if v.cur, err = v.next(); err != nil {
 			return nil, 0, err
 		}
 		if v.cur == nil {
@@ -360,7 +624,7 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 	}
 	for {
 		if v.peek == nil {
-			if v.peek, err = v.pull(); err != nil {
+			if v.peek, err = v.next(); err != nil {
 				return nil, 0, err
 			}
 		}
@@ -370,14 +634,16 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 		v.cur, v.peek = v.peek, nil
 		v.seq++
 	}
-	if v.frameSeq != v.seq {
-		f, err := v.dec.Decode(v.cur.data)
-		if err != nil {
-			return nil, 0, err
+	if v.shownSeq != v.seq {
+		f := v.cur.frame
+		if f == nil {
+			if f, err = v.intra.Decode(v.cur.data); err != nil {
+				return nil, 0, err
+			}
 		}
-		v.frame, v.frameSeq = process.Rotate(f, v.rotation), v.seq
+		v.shown, v.shownSeq = process.Rotate(f, v.rotation), v.seq
 	}
-	return v.frame, v.seq, nil
+	return v.shown, v.seq, nil
 }
 
 // decodeStill loads a still image as a frame, honouring EXIF orientation.

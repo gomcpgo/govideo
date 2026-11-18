@@ -6,9 +6,18 @@ This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 Third-party software
 --------------------
 
-golang.org/x/image (WebP still-image decoding)
+golang.org/x/image (WebP still-image decoding, text rendering) and
+golang.org/x/text, golang.org/x/sys (its dependencies)
   Copyright 2009 The Go Authors. BSD 3-Clause licence.
   https://cs.opensource.google/go/x/image
+
+Go fonts (Go Bold, the built-in typeface for generated text)
+  Copyright 2016 Bigelow & Holmes Inc. BSD 3-Clause licence.
+  https://go.dev/blog/go-fonts
+
+github.com/ebitengine/purego (calls into the macOS codec frameworks)
+  Copyright 2022 The Ebitengine Authors. Apache License 2.0.
+  https://github.com/ebitengine/purego
 
 No codec source code from other projects has been adapted into this module.
 When code is adapted from a permissively licensed reference implementation,

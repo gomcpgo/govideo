@@ -44,6 +44,9 @@ type muxTrack struct {
 	hasCTS    bool
 	sync      []uint32
 	chunkOffs []int64
+	editStart int64  // media time presentation starts at (elst), when hasEdit
+	editDur   uint64 // media ticks presented
+	hasEdit   bool
 	stsc      []run // count = number of chunks with this samples-per-chunk; value = samples per chunk
 	curChunk  uint32
 }
@@ -74,6 +77,29 @@ func (m *Muxer) AddTrack(cfg TrackConfig) int {
 	}
 	m.tracks = append(m.tracks, &muxTrack{cfg: cfg})
 	return len(m.tracks) - 1
+}
+
+// SetEntry replaces a track's sample entry. Encoders that produce their
+// configuration record with the first sample use it; it may be called any
+// time before Finish.
+func (m *Muxer) SetEntry(track int, entry []byte) {
+	m.tracks[track].cfg.Entry = entry
+}
+
+// SetEdit gives a track an edit list that presents dur media ticks starting
+// at media time start. It is how encoder priming (the leading samples of an
+// AAC stream that a player must discard) is signalled.
+func (m *Muxer) SetEdit(track int, start int64, dur uint64) {
+	t := m.tracks[track]
+	t.editStart, t.editDur, t.hasEdit = start, dur, true
+}
+
+// presented returns the track's presentation duration in media ticks.
+func (t *muxTrack) presented() uint64 {
+	if t.hasEdit {
+		return t.editDur
+	}
+	return t.duration
 }
 
 func appendRun(r []run, v uint32, n uint32) []run {
@@ -225,7 +251,7 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 	b := &buf{}
 	var movieDur uint64
 	for _, t := range m.tracks {
-		if d := scaleDur(t.duration, t.cfg.Timescale); d > movieDur {
+		if d := scaleDur(t.presented(), t.cfg.Timescale); d > movieDur {
 			movieDur = d
 		}
 	}
@@ -261,7 +287,7 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 					b.u32(0)
 					b.u32(uint32(i + 1))
 					b.u32(0)
-					b.u32(uint32(scaleDur(t.duration, cfg.Timescale)))
+					b.u32(uint32(scaleDur(t.presented(), cfg.Timescale)))
 					b.zero(8)
 					b.u16(0) // layer
 					b.u16(uint16(cfg.AltGroup))
@@ -275,6 +301,17 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 					b.u32(uint32(cfg.Width) << 16)
 					b.u32(uint32(cfg.Height) << 16)
 				})
+				if t.hasEdit {
+					b.box("edts", func() {
+						b.box("elst", func() {
+							b.u32(0)
+							b.u32(1)
+							b.u32(uint32(scaleDur(t.editDur, cfg.Timescale)))
+							b.u32(uint32(t.editStart))
+							b.u32(0x10000) // rate 1.0
+						})
+					})
+				}
 				b.box("mdia", func() {
 					if t.duration > 0xffffffff {
 						b.box("mdhd", func() {
@@ -516,6 +553,35 @@ func AudioEntry(format string, channels, bits, sampleRate int, children ...[]byt
 		for _, c := range children {
 			w.bytes(c)
 		}
+	})
+	return w.b
+}
+
+// AudioEntryQT builds a QuickTime version 1 sound description for compressed
+// audio: the codec configuration (an esds box) sits inside a 'wave' atom
+// (QuickTime File Format, "Sound Sample Description (Version 1)").
+func AudioEntryQT(format string, channels, sampleRate, samplesPerPacket int, esds []byte) []byte {
+	w := &buf{}
+	w.box(format, func() {
+		w.zero(6)
+		w.u16(1)
+		w.u16(1) // version 1
+		w.zero(6)
+		w.u16(uint16(channels))
+		w.u16(16)
+		w.u16(0xfffe) // compression ID -2: variable bit rate
+		w.u16(0)
+		w.u32(uint32(sampleRate) << 16)
+		w.u32(uint32(samplesPerPacket))
+		w.u32(0) // bytes per packet
+		w.u32(0) // bytes per frame
+		w.u32(2) // bytes per sample
+		w.box("wave", func() {
+			w.box("frma", func() { w.str(format) })
+			w.box(format, func() { w.u32(0) })
+			w.bytes(esds)
+			w.box("\x00\x00\x00\x00", func() {})
+		})
 	})
 	return w.b
 }

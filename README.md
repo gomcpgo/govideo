@@ -8,7 +8,7 @@ go get github.com/gomcpgo/govideo
 
 Requires Go 1.27 or later. No cgo.
 
-> **Status: phase 0 (foundation).** Media inspection is complete for MP4/MOV and Matroska/WebM. The editing pipeline works end to end, but only with the codecs implemented so far: **Motion JPEG and LPCM**. H.264, HEVC and AAC (through the operating-system codecs) and the native VP8/VP9/AV1/Opus codecs are not written yet, so phone and camera footage cannot be decoded and the widely playable H.264 + AAC export does not exist yet. See [Roadmap](#roadmap).
+> **Status: phase 1 in progress.** On **macOS**, H.264, HEVC and AAC are decoded through the system codecs (VideoToolbox, AudioToolbox), and the widely playable **H.264 + AAC** export works. On Windows the system codec backend is not written yet, and Linux has no system codecs, so there only Motion JPEG and LPCM work for now. The native VP8/VP9/AV1/Opus codecs are not written yet. See [Roadmap](#roadmap).
 
 ## Inspecting media: `videoprobe`
 
@@ -27,7 +27,7 @@ js, _ := info.JSON() // field names close to `ffprobe -show_format -show_streams
 
 | | Supported |
 |---|---|
-| Containers | MP4, MOV, fragmented MP4, Matroska, WebM (including files with no duration or cues), WAV |
+| Containers | MP4, MOV, 3GP, fragmented MP4, Matroska, WebM (including files with no duration or cues), AVI, WAV |
 | Video headers | H.264, HEVC, AV1, VP8, VP9; ProRes and Motion JPEG are identified |
 | Audio headers | AAC (LC, HE-AAC, HE-AACv2), Opus, FLAC, MP3, ALAC, LPCM |
 | Reported | duration, start time, frame rate, variable-frame-rate flag, coded and display size, aspect ratio, rotation, bit depth, chroma format, colour tags, HLG/PQ, Dolby Vision configuration, sample rate, channels, language, faststart, fragmentation, tags |
@@ -40,30 +40,41 @@ tl := govideo.NewTimeline(govideo.Canvas{
     FrameRate: govideo.R(30, 1),
     Fit:       govideo.Contain,
 })
+tl.AddGenerated(2*time.Second, govideo.GenerateOptions{
+    Pattern: govideo.PatternGradient, Color: color.RGBA{20, 30, 90, 255}, Color2: color.Black,
+    Text:    "Summer 2026",
+})
 tl.AddImage("title.png", 3*time.Second, govideo.ImageOptions{})
 tl.AddClip("intro.mov", govideo.ClipOptions{Trim: govideo.Range(2*time.Second, 14*time.Second)})
 tl.AddAudio("music.wav", govideo.AudioOptions{Mode: govideo.Mix, Gain: 0.3, FadeOut: 2 * time.Second})
 tl.AddCaptions("subs.srt", govideo.CaptionOptions{Sidecar: true})
 
-err := tl.Export(ctx, "out.mov", govideo.ExportOptions{
+err := tl.Export(ctx, "out.mp4", govideo.ExportOptions{
+    Profile:  govideo.ProfileAuto, // H.264 + AAC where the system has the encoders
     Progress: func(p govideo.Progress) { fmt.Printf("%d/%d\n", p.Frame, p.TotalFrames) },
 })
 ```
 
 What works today:
 
-- **Clips** in MP4, MOV or Matroska containing Motion JPEG video and/or LPCM audio, with trimming. Rotation metadata is applied.
+- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 and HEVC (8-bit and 10-bit, macOS only), Motion JPEG. Audio: AAC (macOS only), LPCM. Rotation metadata is applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins.
 - **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
-- **Audio** from WAV or LPCM tracks: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
+- **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
+- **Audio** from WAV files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
 - **Captions** from SRT or WebVTT as a soft subtitle track (`tx3g`), with an optional `.vtt` sidecar for web players.
-- **Export** as Motion JPEG + 16-bit LPCM in `.mov` or `.mp4`, with the index at the front of the file (faststart). The files are large; this is an intermediate format that editors and ffmpeg read, not a delivery format.
+- **Export**, with the index at the front of the file (faststart), in `.mp4` or `.mov`:
+  - `ProfileCompatible`: H.264 High + AAC-LC, tagged BT.709. macOS only for now. `Quality`, or explicit `VideoBitrate` and `AudioBitrate`, set the size.
+  - `ProfileIntermediate`: Motion JPEG + 16-bit LPCM, using only native codecs, on every platform. The files are large; this is a format that editors and ffmpeg read, not a delivery format.
+  - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
+
+Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames; captions cannot be burned in yet.
 
 Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. `govideo.Codecs()` lists what is usable.
 
 ## Codec policy
 
-govideo natively implements only codecs whose patents have expired or that are royalty-free. Patent-pooled codecs (H.264, HEVC, AAC) will be used **only through the operating system's own codecs** (VideoToolbox/AudioToolbox on macOS, Media Foundation on Windows).
+govideo natively implements only codecs whose patents have expired or that are royalty-free. Patent-pooled codecs (H.264, HEVC, AAC) are used **only through the operating system's own codecs** (VideoToolbox/AudioToolbox on macOS today; Media Foundation on Windows is planned). The bindings use [purego](https://github.com/ebitengine/purego); there is no cgo.
 
 - **If the platform has no codec, govideo has no codec.** Linux has no licensed OS codec, so on Linux govideo will never decode or encode H.264, HEVC or AAC. Only the royalty-free path (WebM/VP8/VP9/AV1/Opus input, AV1 + Opus output) will work there. There will be no OpenH264, ffmpeg or other fallback.
 - **Windows:** HEVC decoding will need Microsoft's HEVC Video Extensions. "N" editions need the Media Feature Pack.
@@ -76,8 +87,8 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 
 | Phase | Adds |
 |---|---|
-| 0 (this version) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 | macOS and Windows OS codecs (H.264, HEVC decode, AAC), HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions, H.264 + AAC export |
+| 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |
@@ -90,7 +101,13 @@ A JSON project file for describing builds, and a small command line for simple o
 go test ./...
 ```
 
-Tests that compare against ffprobe or decode exports with ffmpeg skip themselves when those binaries are not installed. Test media is generated at test time and never committed.
+Tests that compare against ffprobe or decode exports with ffmpeg skip themselves when those binaries are not installed, and tests of the system codecs skip where there are none. Test media is generated at test time and never committed.
+
+To check your own footage, point the suite at a folder of media files. Each file is exported with every available profile and the result is decoded by ffmpeg:
+
+```
+GOVIDEO_TEST_MEDIA=/path/to/videos go test . -run TestRealMedia -v
+```
 
 ## Licence
 

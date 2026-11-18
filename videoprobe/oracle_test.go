@@ -78,6 +78,9 @@ var fixtures = []fixture{
 	{name: "mp3.mp4", args: cat(lavfi("", "sine=f=440:d=2:r=44100"), []string{"-c:a", "libmp3lame", "-ac", "2"})},
 	{name: "aac_51.m4a", args: cat(lavfi("", asrc), []string{"-c:a", "aac", "-ac", "6"})},
 	{name: "audio.wav", args: cat(lavfi("", asrc), []string{"-c:a", "pcm_s16le", "-ac", "2"})},
+	{name: "mjpeg_pcm.avi", args: cat(lavfi(vsrc, asrc), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_s16le"})},
+	{name: "mjpeg_pcm_u8.avi", args: cat(lavfi(vsrc, "sine=f=440:d=2:r=11025"), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_u8", "-ac", "1"})},
+	{name: "mjpeg_ntsc_f32.avi", args: cat(lavfi("testsrc2=d=2:s=640x360:r=30000/1001", "sine=f=440:d=2:r=44100"), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_f32le", "-ac", "2"})},
 	{name: "prores.mov", args: cat(lavfi(vsrc, ""), []string{"-c:v", "prores_videotoolbox", "-profile:v", "hq"}), opt: true},
 }
 

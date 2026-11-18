@@ -6,7 +6,9 @@ package oracle
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -148,4 +150,43 @@ func Ratio(s string) float64 {
 		return 0
 	}
 	return n / d
+}
+
+// FFmpegOutput runs ffmpeg and returns what it wrote to standard output,
+// failing the test on error. It is used to decode media to raw samples.
+func FFmpegOutput(t testing.TB, args ...string) []byte {
+	t.Helper()
+	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "error", "-nostdin"}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ffmpeg %s: %v: %s", strings.Join(args, " "), err, stderr.String())
+	}
+	return out
+}
+
+// Frames decodes every video frame of path to packed RGB24 at w by h.
+func Frames(t testing.TB, path string, w, h int) [][]byte {
+	t.Helper()
+	raw := FFmpegOutput(t, "-i", path, "-map", "0:v:0", "-vf", "scale="+strconv.Itoa(w)+":"+strconv.Itoa(h)+":flags=neighbor",
+		"-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+	size := w * h * 3
+	frames := make([][]byte, 0, len(raw)/size)
+	for ; len(raw) >= size; raw = raw[size:] {
+		frames = append(frames, raw[:size])
+	}
+	return frames
+}
+
+// Audio decodes an audio stream of path (for example "0:a:0") to mono
+// float32 samples at 48 kHz, honouring edit lists as a player would.
+func Audio(t testing.TB, path, stream string) []float32 {
+	t.Helper()
+	raw := FFmpegOutput(t, "-i", path, "-map", stream, "-ac", "1", "-ar", "48000", "-f", "f32le", "-")
+	out := make([]float32, len(raw)/4)
+	for i := range out {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
+	}
+	return out
 }

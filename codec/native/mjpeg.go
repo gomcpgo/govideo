@@ -12,11 +12,13 @@ import (
 
 // MJPEGDecoder decodes Motion JPEG: each packet is one baseline or
 // progressive JPEG image (ITU-T T.81), decoded with the Go standard library.
+// Frames without Huffman tables, as AVI files carry them, get the standard
+// ones.
 type MJPEGDecoder struct{}
 
 // Decode returns the picture as a BT.709 limited-range 4:2:0 frame.
 func (MJPEGDecoder) Decode(p []byte) (*codec.VideoFrame, error) {
-	img, err := jpeg.Decode(bytes.NewReader(p))
+	img, err := jpeg.Decode(bytes.NewReader(withHuffmanTables(p)))
 	if err != nil {
 		return nil, err
 	}

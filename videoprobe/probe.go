@@ -15,6 +15,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/wav"
@@ -55,7 +56,7 @@ func (k Kind) String() string {
 
 // Info describes a media file.
 type Info struct {
-	Format     string // "mp4", "mov", "matroska", "webm", "wav"
+	Format     string // "mp4", "mov", "matroska", "webm", "wav", "avi"
 	Duration   time.Duration
 	StartTime  time.Duration
 	BitRate    int64 // bits per second, overall
@@ -69,7 +70,7 @@ type Info struct {
 // Stream describes one track.
 type Stream struct {
 	Index     int
-	ID        int64  // container track ID (MP4) or track number (Matroska)
+	ID        int64  // container track ID (MP4), track number (Matroska) or stream number (AVI)
 	Kind      Kind   // Video, Audio, Subtitle, Data
 	Codec     string // "h264", "hevc", "av1", "vp9", "aac", "opus", ...; "" if unknown
 	CodecTag  string // "avc1", "hvc1", "mp4a", "V_VP9", ...
@@ -159,6 +160,12 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 			return nil, err
 		}
 		info = fromWAV(f)
+	case avi.Sniff(head):
+		f, err := avi.Open(ctx, r, size)
+		if err != nil {
+			return nil, err
+		}
+		info = fromAVI(f)
 	case isobmff.Sniff(head):
 		f, err := isobmff.Open(ctx, r, size)
 		if err != nil {

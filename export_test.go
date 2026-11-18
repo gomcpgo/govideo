@@ -97,7 +97,26 @@ func TestExportEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, name := range []string{"out.mov", "out.mp4"} {
+	type variant struct {
+		name         string
+		profile      govideo.Profile
+		video, audio string
+	}
+	variants := []variant{
+		{"out.mov", govideo.ProfileIntermediate, "mjpeg", "pcm_s16le"},
+		{"out.mp4", govideo.ProfileIntermediate, "mjpeg", "pcm_s16le"},
+	}
+	if govideo.BuildInfo().OSBackend {
+		variants = append(variants,
+			variant{"h264.mov", govideo.ProfileCompatible, "h264", "aac"},
+			variant{"h264.mp4", govideo.ProfileCompatible, "h264", "aac"},
+			// ProfileAuto resolves to ProfileCompatible where the system has the encoders.
+			variant{"auto.mp4", govideo.ProfileAuto, "h264", "aac"})
+	} else {
+		variants = append(variants, variant{"auto.mp4", govideo.ProfileAuto, "mjpeg", "pcm_s16le"})
+	}
+	for _, vr := range variants {
+		name := vr.name
 		t.Run(name, func(t *testing.T) {
 			tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1)})
 			tl.AddImage(p("red.png"), time.Second, govideo.ImageOptions{})                                           // 0.0 – 1.0
@@ -109,7 +128,8 @@ func TestExportEndToEnd(t *testing.T) {
 
 			var last govideo.Progress
 			out := p(name)
-			err := tl.Export(context.Background(), out, govideo.ExportOptions{Progress: func(pr govideo.Progress) { last = pr }})
+			err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: vr.profile,
+				Progress: func(pr govideo.Progress) { last = pr }})
 			if err != nil {
 				t.Fatalf("Export: %v", err)
 			}
@@ -126,13 +146,13 @@ func TestExportEndToEnd(t *testing.T) {
 				t.Fatalf("got %d streams, want 4 (video, audio, audio, subtitle)", len(pr.Streams))
 			}
 			v, a, a2, s := pr.Streams[0], pr.Streams[1], pr.Streams[2], pr.Streams[3]
-			if v.CodecName != "mjpeg" || v.Width != 640 || v.Height != 360 || v.RFrameRate != "30/1" || v.NbReadPackets != "120" {
+			if v.CodecName != vr.video || v.Width != 640 || v.Height != 360 || v.RFrameRate != "30/1" || v.NbReadPackets != "120" {
 				t.Errorf("video: %s %dx%d %s, %s packets", v.CodecName, v.Width, v.Height, v.RFrameRate, v.NbReadPackets)
 			}
-			if a.CodecName != "pcm_s16le" || a.SampleRate != "48000" || a.Channels != 2 {
+			if a.CodecName != vr.audio || a.SampleRate != "48000" || a.Channels != 2 {
 				t.Errorf("audio: %s %s Hz %d ch", a.CodecName, a.SampleRate, a.Channels)
 			}
-			if a2.CodecName != "pcm_s16le" || a2.Tags["language"] != "fra" {
+			if a2.CodecName != vr.audio || a2.Tags["language"] != "fra" {
 				t.Errorf("second audio: %s language %q", a2.CodecName, a2.Tags["language"])
 			}
 			if s.CodecName != "mov_text" || s.Tags["language"] != "eng" {
@@ -203,7 +223,7 @@ func TestExportEndToEnd(t *testing.T) {
 					t.Errorf("extracted captions lack %q:\n%s", want, txt)
 				}
 			}
-			if _, err := os.Stat(p(name[:3] + ".vtt")); err != nil {
+			if _, err := os.Stat(p(name[:len(name)-4] + ".vtt")); err != nil {
 				t.Errorf("sidecar: %v", err)
 			}
 		})
@@ -220,25 +240,22 @@ func contains(s, sub string) bool {
 }
 
 func TestExportCodecUnavailable(t *testing.T) {
-	oracle.Require(t)
 	dir := t.TempDir()
-	in := filepath.Join(dir, "h264.mp4")
-	oracle.FFmpeg(t, "-f", "lavfi", "-i", "testsrc2=d=1:s=320x240:r=25", "-c:v", "libx264", "-pix_fmt", "yuv420p", in)
+	// A profile whose encoders do not exist fails before anything is read.
 	tl := govideo.NewTimeline(govideo.Canvas{})
-	tl.AddClip(in, govideo.ClipOptions{})
-	err := tl.Export(context.Background(), filepath.Join(dir, "out.mov"), govideo.ExportOptions{})
-	var cu *govideo.ErrCodecUnavailable
-	if !errors.As(err, &cu) || cu.Codec != "h264" || cu.Op != govideo.Decode {
-		t.Fatalf("got %v, want ErrCodecUnavailable for h264 decode", err)
-	}
-	// An explicit profile whose codecs are missing fails the same way.
-	tl = govideo.NewTimeline(govideo.Canvas{})
 	tl.AddImage("unused.png", time.Second, govideo.ImageOptions{})
-	err = tl.Export(context.Background(), filepath.Join(dir, "out.mp4"), govideo.ExportOptions{Profile: govideo.ProfileCompatible})
-	if !errors.As(err, &cu) || cu.Op != govideo.Encode {
-		t.Fatalf("got %v, want ErrCodecUnavailable for encode", err)
+	err := tl.Export(context.Background(), filepath.Join(dir, "out.mp4"), govideo.ExportOptions{Profile: govideo.ProfileRoyaltyFree})
+	var cu *govideo.ErrCodecUnavailable
+	if !errors.As(err, &cu) || cu.Op != govideo.Encode || cu.Codec != "av1" {
+		t.Fatalf("got %v, want ErrCodecUnavailable for av1 encode", err)
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+	if !govideo.BuildInfo().OSBackend {
+		err = tl.Export(context.Background(), filepath.Join(dir, "out.mp4"), govideo.ExportOptions{Profile: govideo.ProfileCompatible})
+		if !errors.As(err, &cu) || cu.Op != govideo.Encode || cu.Codec != "h264" {
+			t.Fatalf("got %v, want ErrCodecUnavailable for h264 encode", err)
+		}
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 		t.Errorf("failed exports left files behind: %v", entries)
 	}
 }
@@ -248,13 +265,28 @@ func TestRegistry(t *testing.T) {
 	for _, c := range govideo.Codecs() {
 		ids[c.ID] = true
 	}
-	if !ids["pcm"] || !ids["mjpeg"] || ids["h264"] {
-		t.Errorf("unexpected codec list: %v", ids)
+	osb := govideo.BuildInfo().OSBackend
+	if !ids["pcm"] || !ids["mjpeg"] || ids["h264"] != osb || ids["aac"] != osb || ids["hevc"] != osb {
+		t.Errorf("unexpected codec list (OS backend %v): %v", osb, ids)
 	}
 	if _, err := govideo.Available("pcm_s24le", govideo.Decode); err != nil {
 		t.Errorf("pcm_s24le should be decodable: %v", err)
 	}
-	if _, err := govideo.Available("aac", govideo.Encode); err == nil {
-		t.Error("aac must not be available natively")
+	// Patent-pooled codecs are never native: they come from the operating
+	// system or not at all.
+	for _, c := range govideo.Codecs() {
+		if c.PatentClass == govideo.OSOnly && c.Backend != govideo.OS {
+			t.Errorf("%s is patent-pooled but registered with the %s backend", c.ID, c.Backend)
+		}
+	}
+	if ci, err := govideo.Available("aac", govideo.Encode); (err == nil) != osb || (err == nil && ci.Backend != govideo.OS) {
+		t.Errorf("aac encode: %+v, %v (OS backend %v)", ci, err, osb)
+	}
+	if _, err := govideo.Available("hevc", govideo.Encode); err == nil {
+		t.Error("hevc output is not offered")
+	}
+	var cu *govideo.ErrCodecUnavailable
+	if _, err := govideo.Available("vp9", govideo.Decode); !errors.As(err, &cu) || cu.Reason == "" {
+		t.Errorf("vp9 decode: %v, want ErrCodecUnavailable with a reason", err)
 	}
 }

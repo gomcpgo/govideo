@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gomcpgo/govideo/internal/codechdr"
+	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/wav"
 )
@@ -207,4 +208,80 @@ func fromWAV(f *wav.File) *Info {
 			ChannelLayout: defaultLayout(f.Channels)},
 	}
 	return &Info{Format: "wav", Duration: s.Duration, Tags: map[string]string{}, Streams: []Stream{s}}
+}
+
+// aviVideoCodecs maps upper-cased video fourccs (biCompression, else the
+// strh handler) to ffprobe codec names.
+var aviVideoCodecs = map[string]string{
+	"MJPG": "mjpeg", "AVRN": "mjpeg", "DMB1": "mjpeg", "JPEG": "mjpeg", "AVDJ": "mjpeg",
+	"H264": "h264", "X264": "h264", "AVC1": "h264",
+	"HEVC": "hevc", "H265": "hevc", "X265": "hevc", "HVC1": "hevc", "HEV1": "hevc",
+	"XVID": "mpeg4", "DIVX": "mpeg4", "DX50": "mpeg4", "FMP4": "mpeg4", "MP4V": "mpeg4",
+	"MPG1": "mpeg1video", "MPG2": "mpeg2video",
+	"VP80": "vp8", "VP90": "vp9", "AV01": "av1",
+	"DVSD": "dvvideo", "DVHD": "dvvideo", "DVSL": "dvvideo",
+}
+
+// aviAudioCodecs maps WAVEFORMATEX format tags of compressed audio to
+// ffprobe codec names; PCM is named from the sample size.
+var aviAudioCodecs = map[uint16]string{
+	0x0006: "pcm_alaw", 0x0007: "pcm_mulaw", 0x0050: "mp2", avi.FormatMP3: "mp3",
+	avi.FormatAAC: "aac", avi.FormatAC3: "ac3", 0x2001: "dts",
+}
+
+func fromAVI(f *avi.File) *Info {
+	info := &Info{Format: "avi", Duration: f.Duration, Tags: map[string]string{}}
+	first := true
+	for _, t := range f.Streams {
+		s := Stream{
+			ID: int64(t.Index), Kind: Data, TimeBase: reduce(int64(t.Scale), int64(t.Rate)),
+			StartTime: t.StartTime(), Duration: t.Duration(), Frames: t.Frames(),
+		}
+		if d := s.Duration.Seconds(); d > 0 {
+			s.BitRate = int64(float64(t.TotalBytes) * 8 / d)
+		}
+		switch t.Type {
+		case avi.StreamVideo:
+			s.Kind = Video
+			s.CodecTag = t.FourCC()
+			s.Codec = aviVideoCodecs[strings.ToUpper(s.CodecTag)]
+			vi := &VideoInfo{Width: t.Width, Height: t.Height, CodedWidth: t.Width, CodedHeight: t.Height}
+			s.Video = vi
+			if s.Codec == "mjpeg" {
+				vi.BitDepth = 8
+			}
+			if num, den := t.FrameRate(); den > 0 {
+				vi.FrameRate = reduce(int64(num), int64(den))
+				vi.AvgFrameRate = vi.FrameRate
+			}
+			vi.setAspect(0, 0)
+			c := colourOf(nil)
+			c.apply(vi)
+		case avi.StreamAudio:
+			s.Kind = Audio
+			s.CodecTag = fmt.Sprintf("0x%04x", t.FormatTag)
+			switch {
+			case t.FormatTag == avi.FormatPCM && t.BitsPerSample%8 == 0 && t.BitsPerSample >= 8 && t.BitsPerSample <= 32:
+				s.Codec = pcmName("s", t.BitsPerSample, true)
+			case t.FormatTag == avi.FormatIEEEFloat && (t.BitsPerSample == 32 || t.BitsPerSample == 64):
+				s.Codec = pcmName("f", t.BitsPerSample, true)
+			default:
+				s.Codec = aviAudioCodecs[t.FormatTag]
+			}
+			if t.IsPCM() {
+				s.TimeBase = Rational{1, int64(t.SampleRate)}
+				s.BitRate = int64(t.SampleRate) * int64(t.BlockAlign) * 8
+			}
+			s.Audio = &AudioInfo{SampleRate: t.SampleRate, Channels: t.Channels, BitDepth: t.BitsPerSample,
+				ChannelLayout: defaultLayout(t.Channels)}
+		}
+		if s.Kind == Video || s.Kind == Audio {
+			if first || s.StartTime < info.StartTime {
+				info.StartTime = s.StartTime
+				first = false
+			}
+		}
+		info.Streams = append(info.Streams, s)
+	}
+	return info
 }

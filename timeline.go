@@ -86,6 +86,7 @@ type itemKind int
 const (
 	itemClip itemKind = iota
 	itemImage
+	itemGenerated
 )
 
 type item struct {
@@ -94,6 +95,15 @@ type item struct {
 	dur   time.Duration // images
 	clip  ClipOptions
 	image ImageOptions
+	gen   GenerateOptions
+}
+
+// label names the item in error messages.
+func (it item) label() string {
+	if it.kind == itemGenerated {
+		return "generated " + it.gen.Pattern.String() + " segment"
+	}
+	return it.path
 }
 
 type audioItem struct {
@@ -106,7 +116,8 @@ type captionItem struct {
 	opts CaptionOptions
 }
 
-// Timeline is an ordered sequence of clips and still images, plus audio
+// Timeline is an ordered sequence of clips, still images and generated
+// segments, plus audio
 // files and captions laid over it. Nothing is read until Export.
 type Timeline struct {
 	canvas   Canvas

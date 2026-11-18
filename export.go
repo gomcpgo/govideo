@@ -12,7 +12,6 @@ import (
 
 	"github.com/gomcpgo/govideo/caption"
 	"github.com/gomcpgo/govideo/codec"
-	"github.com/gomcpgo/govideo/codec/native"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/process"
 	"github.com/gomcpgo/govideo/videoprobe"
@@ -57,9 +56,13 @@ type Progress struct {
 
 // ExportOptions configures Export.
 type ExportOptions struct {
-	Profile  Profile
-	Quality  Quality
-	Progress func(Progress)
+	Profile Profile
+	Quality Quality
+	// VideoBitrate and AudioBitrate, in bits per second, override the rates
+	// that Quality selects. They apply to ProfileCompatible.
+	VideoBitrate int
+	AudioBitrate int
+	Progress     func(Progress)
 }
 
 func resolveProfile(p Profile) (Profile, error) {
@@ -87,9 +90,12 @@ func resolveProfile(p Profile) (Profile, error) {
 type segment struct {
 	frames int64 // output frames
 	trim   time.Duration
+	origin time.Duration     // source time of the clip's first video frame
 	video  *videoStream      // nil for stills and audio-only clips
 	still  *codec.VideoFrame // canvas-sized
 	audio  *audioStream      // nil for silence
+	gen    *generator        // animated generated picture
+	tone   *tone             // generated audio
 	gain   float32
 }
 
@@ -99,7 +105,7 @@ type overlay struct {
 	opts          AudioOptions
 	start, length int64 // in 48 kHz frames on the timeline
 	pos           int64
-	track         int // mux track for Track mode
+	sink          audioSink // its own track, in Track mode
 }
 
 // Export renders the timeline to path. The container is chosen by the file
@@ -110,7 +116,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 	if err != nil {
 		return err
 	}
-	if profile != ProfileIntermediate {
+	if profile == ProfileRoyaltyFree {
 		return fmt.Errorf("govideo: profile %s: %w", profile, ErrNotImplemented)
 	}
 	var brand isobmff.Brand
@@ -123,7 +129,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		return fmt.Errorf("govideo: unsupported output extension %q (use .mp4 or .mov)", filepath.Ext(path))
 	}
 	if len(t.items) == 0 {
-		return errors.New("govideo: the timeline has no clips or images")
+		return errors.New("govideo: the timeline has no clips, images or generated segments")
 	}
 	for _, c := range t.captions {
 		if c.opts.Mode == Burn {
@@ -131,11 +137,27 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		}
 	}
 	cv := t.canvas
+	if profile == ProfileCompatible && (cv.Width%2 != 0 || cv.Height%2 != 0) {
+		return fmt.Errorf("govideo: H.264 needs an even canvas size, not %dx%d", cv.Width, cv.Height)
+	}
 	fps := cv.FrameRate
 	fit := process.FitMode(cv.Fit)
 
 	var opened []*media
+	var segs []*segment
+	var overlays []*overlay
 	defer func() {
+		for _, sg := range segs {
+			if sg.video != nil {
+				sg.video.close()
+			}
+			if sg.audio != nil {
+				sg.audio.close()
+			}
+		}
+		for _, ov := range overlays {
+			ov.as.close()
+		}
 		for _, m := range opened {
 			m.close()
 		}
@@ -150,13 +172,16 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 
 	// Prepare segments. Boundaries are rounded on the cumulative timeline so
 	// rounding never accumulates.
-	var segs []*segment
 	var cum time.Duration
+	// Frame selection tolerance: four tenths of an output frame (see
+	// videoStream.frameAt).
+	slack := time.Duration(0.4 * float64(fps.Den) / float64(fps.Num) * 1e9)
 	frameAtTime := func(d time.Duration) int64 {
 		return int64(d.Seconds()*fps.Float() + 0.5)
 	}
 	for _, it := range t.items {
 		sg := &segment{gain: 1}
+		segs = append(segs, sg) // owned from here on, so its decoders get closed
 		var dur time.Duration
 		switch it.kind {
 		case itemImage:
@@ -166,16 +191,39 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			}
 			sg.still = process.Fit(img, cv.Width, cv.Height, fit, cv.Background)
 			dur = it.dur
+		case itemGenerated:
+			g, err := newGenerator(cv, it.gen)
+			if err != nil {
+				return err
+			}
+			if g.animated() {
+				sg.gen = g
+			} else {
+				sg.still = g.frame(0)
+			}
+			if it.gen.Tone > 0 {
+				sg.tone = &tone{freq: it.gen.Tone, gain: it.gen.ToneGain, beep: it.gen.Beep}
+				if sg.tone.gain <= 0 {
+					sg.tone.gain = 0.25
+				}
+			}
+			dur = it.dur
 		case itemClip:
 			m, err := open(it.path)
 			if err != nil {
 				return err
 			}
 			vs, as := m.stream(videoprobe.Video), m.stream(videoprobe.Audio)
+			// A clip's time starts at its first video frame. Files often
+			// start their video a little late (after audio encoder priming,
+			// or a B-frame delay); playing that gap would repeat the first
+			// frame and make the join to the previous clip stutter. Audio
+			// keeps its position relative to the picture.
 			var src time.Duration
 			switch {
 			case vs != nil:
-				src = vs.StartTime + vs.Duration
+				sg.origin = max(vs.StartTime, 0)
+				src = m.videoSpan(vs)
 			case as != nil:
 				src = as.StartTime + as.Duration
 			default:
@@ -193,14 +241,14 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			}
 			sg.trim, dur = start, end-start
 			if vs != nil {
-				if sg.video, err = openVideo(ctx, m, vs); err != nil {
+				if sg.video, err = openVideo(ctx, m, vs, sg.origin+start, slack); err != nil {
 					return err
 				}
 			} else {
 				sg.still = process.Fit(codec.NewVideoFrame(cv.Width, cv.Height), cv.Width, cv.Height, process.Stretch, cv.Background)
 			}
 			if as != nil && !it.clip.Mute {
-				if sg.audio, err = openAudio(ctx, m, as, start); err != nil {
+				if sg.audio, err = openAudio(ctx, m, as, sg.origin+start); err != nil {
 					return err
 				}
 			}
@@ -209,14 +257,11 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			}
 		}
 		if dur <= 0 {
-			return fmt.Errorf("govideo: %s: duration must be positive", it.path)
+			return fmt.Errorf("govideo: %s: duration must be positive", it.label())
 		}
 		first := frameAtTime(cum)
 		cum += dur
 		sg.frames = frameAtTime(cum) - first
-		if sg.frames > 0 {
-			segs = append(segs, sg)
-		}
 	}
 	var totalFrames int64
 	for _, sg := range segs {
@@ -248,20 +293,17 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 	if fps.Num*scale > 1<<31 || fps.Den*scale > 1<<31 {
 		return fmt.Errorf("govideo: unsupported frame rate %v", fps)
 	}
-	var ventry, aentry []byte
-	if brand == isobmff.BrandMOV {
-		ventry = isobmff.VisualEntry("jpeg", cv.Width, cv.Height, "Photo - JPEG")
-		aentry = isobmff.AudioEntry("sowt", 2, 16, outRate)
-	} else {
-		ventry = isobmff.VisualEntry("mp4v", cv.Width, cv.Height, "", isobmff.ESDS(0x6c, 0x04, nil, 0, 0, 0))
-		aentry = isobmff.AudioEntry("ipcm", 2, 16, outRate, isobmff.PcmC(true, 16))
+	outs := &outputs{profile: profile, brand: brand, mux: mux, canvas: cv, opts: o}
+	defer outs.close()
+	vsink, err := outs.video(uint32(fps.Num*scale), uint32(fps.Den*scale))
+	if err != nil {
+		return err
 	}
-	vtrack := mux.AddTrack(isobmff.TrackConfig{Handler: "vide", Timescale: uint32(fps.Num * scale),
-		Entry: ventry, Width: cv.Width, Height: cv.Height, AllSync: true})
-	audioCfg := isobmff.TrackConfig{Handler: "soun", Timescale: outRate, Entry: aentry, SampleSize: 4, AltGroup: 1}
-	atrack := mux.AddTrack(audioCfg)
+	asink, err := outs.audio("", false)
+	if err != nil {
+		return err
+	}
 
-	var overlays []*overlay
 	for _, a := range t.audio {
 		m, err := open(a.path)
 		if err != nil {
@@ -282,7 +324,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		if start >= end {
 			return fmt.Errorf("govideo: %s: trim range is empty (source is %v long)", a.path, src)
 		}
-		ov := &overlay{opts: a.opts, start: durToFrames(a.opts.Start), length: durToFrames(end - start), track: -1}
+		ov := &overlay{opts: a.opts, start: durToFrames(a.opts.Start), length: durToFrames(end - start)}
 		if ov.start < 0 {
 			return fmt.Errorf("govideo: %s: Start must not be negative", a.path)
 		}
@@ -293,12 +335,12 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		if ov.as, err = openAudio(ctx, m, as, start); err != nil {
 			return err
 		}
-		if a.opts.Mode == Track {
-			cfg := audioCfg
-			cfg.Language, cfg.Disabled = a.opts.Language, true
-			ov.track = mux.AddTrack(cfg)
-		}
 		overlays = append(overlays, ov)
+		if a.opts.Mode == Track {
+			if ov.sink, err = outs.audio(a.opts.Language, true); err != nil {
+				return err
+			}
+		}
 	}
 
 	type subTrack struct {
@@ -346,14 +388,11 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 	}
 
 	// Render.
-	enc := &native.MJPEGEncoder{Quality: map[Quality]int{QualityLow: 70, QualityMedium: 82}[o.Quality]}
 	var (
-		frame    int64
-		prog     []float32
-		side     []float32
-		pcm      []byte
-		lastKey  [2]int64
-		lastData []byte
+		frame   int64
+		prog    []float32
+		side    []float32
+		lastKey [2]int64
 	)
 	for si, sg := range segs {
 		for n := int64(0); n < sg.frames; n++ {
@@ -364,7 +403,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			key := [2]int64{int64(si) + 1, 0}
 			var pic *codec.VideoFrame
 			if sg.video != nil {
-				ts := sg.trim + time.Duration(float64(n)*float64(fps.Den)/float64(fps.Num)*1e9)
+				ts := sg.origin + sg.trim + time.Duration(float64(n)*float64(fps.Den)/float64(fps.Num)*1e9)
 				src, seq, err := sg.video.frameAt(ts)
 				if err != nil {
 					return err
@@ -373,16 +412,16 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 				if key != lastKey {
 					pic = process.Fit(src, cv.Width, cv.Height, fit, cv.Background)
 				}
+			} else if sg.gen != nil {
+				key[1] = n + 1
+				pic = sg.gen.frame(n)
 			} else if key != lastKey {
 				pic = sg.still
 			}
 			if pic != nil {
-				if lastData, err = enc.Encode(pic); err != nil {
-					return err
-				}
 				lastKey = key
 			}
-			if err := mux.WriteSample(vtrack, lastData, uint32(fps.Den*scale), true, 0); err != nil {
+			if err := vsink.write(pic); err != nil {
 				return err
 			}
 
@@ -399,6 +438,8 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 				if sg.gain != 1 {
 					process.ApplyGain(prog, sg.gain)
 				}
+			} else if sg.tone != nil {
+				sg.tone.fill(prog)
 			}
 			for _, ov := range overlays {
 				lo, hi := max(a0, ov.start), min(a1, ov.start+ov.length)
@@ -422,18 +463,16 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 						copy(prog[(lo-a0)*2:], part)
 					}
 				}
-				if ov.track >= 0 && count > 0 {
+				if ov.sink != nil && count > 0 {
 					process.SoftClip(side)
-					pcm = native.AppendS16LE(pcm[:0], side)
-					if err := mux.WriteSample(ov.track, pcm, 0, true, 0); err != nil {
+					if err := ov.sink.write(side); err != nil {
 						return err
 					}
 				}
 			}
 			if count > 0 {
 				process.SoftClip(prog)
-				pcm = native.AppendS16LE(pcm[:0], prog)
-				if err := mux.WriteSample(atrack, pcm, 0, true, 0); err != nil {
+				if err := asink.write(prog); err != nil {
 					return err
 				}
 			}
@@ -441,6 +480,20 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			if o.Progress != nil {
 				o.Progress(Progress{Frame: frame, TotalFrames: totalFrames,
 					Time: time.Duration(float64(frame) / fps.Float() * 1e9), Duration: total})
+			}
+		}
+	}
+
+	if err := vsink.finish(); err != nil {
+		return err
+	}
+	if err := asink.finish(totalAudio); err != nil {
+		return err
+	}
+	for _, ov := range overlays {
+		if ov.sink != nil {
+			if err := ov.sink.finish(totalAudio); err != nil {
+				return err
 			}
 		}
 	}

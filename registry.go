@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/gomcpgo/govideo/codec/oscodec"
 )
 
 // CodecID names a codec, using ffprobe's vocabulary ("h264", "hevc", "av1",
@@ -158,9 +160,14 @@ func Available(id CodecID, op Op) (CodecInfo, error) {
 	case p.backend == OS && runtime.GOOS != "darwin" && runtime.GOOS != "windows":
 		e.Reason = "patent-pooled codec, available only through an operating-system codec, and " + runtime.GOOS + " has none"
 		e.Hint = "run on macOS or Windows, or use royalty-free formats"
+	case p.backend == OS && runtime.GOOS == "darwin" && (id == "h264" || id == "hevc" || id == "aac"):
+		e.Reason = "the macOS codec frameworks could not be loaded"
+		if err := oscodec.Load(); err != nil {
+			e.Reason += ": " + err.Error()
+		}
 	case p.backend == OS:
-		e.Reason = "the operating-system codec backend is not implemented yet"
-		e.Hint = "planned for phase 1"
+		e.Reason = "the operating-system codec backend for this codec is not implemented yet"
+		e.Hint = "planned for phase " + string(rune('0'+p.phase))
 	default:
 		e.Reason = "the native implementation is not written yet"
 		e.Hint = "planned for phase " + string(rune('0'+p.phase))
@@ -190,7 +197,8 @@ type BuildInfoT struct {
 
 // BuildInfo reports the Go version, SIMD state and OS backend presence.
 func BuildInfo() BuildInfoT {
-	return BuildInfoT{GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
+	return BuildInfoT{GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
+		OSBackend: oscodec.Load() == nil}
 }
 
 func init() {
@@ -199,4 +207,15 @@ func init() {
 	register(CodecInfo{ID: "mjpeg", Kind: Video, Backend: Native, PatentClass: Expired,
 		CanDecode: true, CanEncode: true, Profiles: []string{"baseline"}, MaxBitDepth: 8,
 		Chroma: []Chroma{Chroma420, Chroma422, Chroma444}})
+	// Patent-pooled codecs exist only where the operating system has them
+	// (SPEC §4.1, §6). 10-bit HEVC is decoded to 8 bits by the system.
+	if oscodec.Load() == nil {
+		register(CodecInfo{ID: "h264", Kind: Video, Backend: OS, PatentClass: OSOnly,
+			CanDecode: true, CanEncode: true, Profiles: []string{"baseline", "main", "high"}, MaxBitDepth: 8,
+			Chroma: []Chroma{Chroma420}})
+		register(CodecInfo{ID: "hevc", Kind: Video, Backend: OS, PatentClass: OSOnly,
+			CanDecode: true, Profiles: []string{"main", "main10"}, MaxBitDepth: 10, Chroma: []Chroma{Chroma420}})
+		register(CodecInfo{ID: "aac", Kind: Audio, Backend: OS, PatentClass: OSOnly,
+			CanDecode: true, CanEncode: true, Profiles: []string{"lc"}, MaxBitDepth: 16})
+	}
 }

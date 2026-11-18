@@ -4,6 +4,8 @@
 *.mkv
 *.webm
 *.wav
+*.avi
+*.3gp
 .govideo-*
 *.test
 *.out
