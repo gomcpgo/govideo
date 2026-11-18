@@ -1,0 +1,14 @@
+# Test media is generated at test time by the ffmpeg oracle; never commit it.
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.wav
+.govideo-*
+*.test
+*.out
+
+# Internal notes live outside this repository.
+CLAUDE.md
+CLAUDE.local.md
+.claude/

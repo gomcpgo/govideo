@@ -1,0 +1,15 @@
+govideo
+Copyright 2026 The govideo Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party software
+--------------------
+
+golang.org/x/image (WebP still-image decoding)
+  Copyright 2009 The Go Authors. BSD 3-Clause licence.
+  https://cs.opensource.google/go/x/image
+
+No codec source code from other projects has been adapted into this module.
+When code is adapted from a permissively licensed reference implementation,
+its original notice must be added here.

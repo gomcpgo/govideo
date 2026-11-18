@@ -1,0 +1,151 @@
+// Package oracle is a test-only harness that runs locally installed ffmpeg
+// and ffprobe binaries as black-box oracles (SPEC §11). The binaries are
+// never vendored and their source is never read; tests skip when they are
+// not installed. Nothing outside _test files may import this package.
+package oracle
+
+import (
+	"bytes"
+	"encoding/json"
+	"os/exec"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// Require skips the test unless ffmpeg and ffprobe are on PATH.
+func Require(t testing.TB) {
+	t.Helper()
+	for _, bin := range []string{"ffmpeg", "ffprobe"} {
+		if _, err := exec.LookPath(bin); err != nil {
+			t.Skipf("%s not installed; skipping oracle test", bin)
+		}
+	}
+}
+
+// FFmpeg runs ffmpeg with the given arguments, failing the test on error.
+func FFmpeg(t testing.TB, args ...string) {
+	t.Helper()
+	if err := TryFFmpeg(args...); err != nil {
+		t.Fatalf("ffmpeg %s: %v", strings.Join(args, " "), err)
+	}
+}
+
+// TryFFmpeg runs ffmpeg and returns its error (with stderr) if it fails.
+func TryFFmpeg(args ...string) error {
+	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "error", "-nostdin", "-y"}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return &runError{err, stderr.String()}
+	}
+	return nil
+}
+
+type runError struct {
+	err    error
+	stderr string
+}
+
+func (e *runError) Error() string { return e.err.Error() + ": " + e.stderr }
+
+// Stream is the subset of ffprobe's per-stream output used by tests.
+type Stream struct {
+	Index         int               `json:"index"`
+	CodecName     string            `json:"codec_name"`
+	CodecType     string            `json:"codec_type"`
+	CodecTag      string            `json:"codec_tag_string"`
+	Profile       string            `json:"profile"`
+	Level         int               `json:"level"`
+	Width         int               `json:"width"`
+	Height        int               `json:"height"`
+	CodedWidth    int               `json:"coded_width"`
+	CodedHeight   int               `json:"coded_height"`
+	SAR           string            `json:"sample_aspect_ratio"`
+	DAR           string            `json:"display_aspect_ratio"`
+	PixFmt        string            `json:"pix_fmt"`
+	FieldOrder    string            `json:"field_order"`
+	RFrameRate    string            `json:"r_frame_rate"`
+	AvgFrameRate  string            `json:"avg_frame_rate"`
+	TimeBase      string            `json:"time_base"`
+	StartTime     string            `json:"start_time"`
+	Duration      string            `json:"duration"`
+	BitRate       string            `json:"bit_rate"`
+	NbFrames      string            `json:"nb_frames"`
+	NbReadPackets string            `json:"nb_read_packets"`
+	ColorRange    string            `json:"color_range"`
+	ColorSpace    string            `json:"color_space"`
+	ColorTransfer string            `json:"color_transfer"`
+	ColorPrim     string            `json:"color_primaries"`
+	SampleRate    string            `json:"sample_rate"`
+	Channels      int               `json:"channels"`
+	ChannelLayout string            `json:"channel_layout"`
+	BitsPerSample int               `json:"bits_per_sample"`
+	Tags          map[string]string `json:"tags"`
+	Disposition   map[string]int    `json:"disposition"`
+	SideData      []map[string]any  `json:"side_data_list"`
+}
+
+// Format is the subset of ffprobe's format output used by tests.
+type Format struct {
+	FormatName string            `json:"format_name"`
+	NbStreams  int               `json:"nb_streams"`
+	StartTime  string            `json:"start_time"`
+	Duration   string            `json:"duration"`
+	Size       string            `json:"size"`
+	BitRate    string            `json:"bit_rate"`
+	Tags       map[string]string `json:"tags"`
+}
+
+// Result is ffprobe's view of a file.
+type Result struct {
+	Streams []Stream `json:"streams"`
+	Format  Format   `json:"format"`
+}
+
+// FFprobe runs ffprobe -show_format -show_streams on path. Extra arguments
+// (for example -count_packets) may be given.
+func FFprobe(t testing.TB, path string, extra ...string) *Result {
+	t.Helper()
+	args := append([]string{"-v", "error", "-show_format", "-show_streams", "-of", "json"}, extra...)
+	out, err := exec.Command("ffprobe", append(args, path)...).Output()
+	if err != nil {
+		t.Fatalf("ffprobe %s: %v", path, err)
+	}
+	var r Result
+	if err := json.Unmarshal(out, &r); err != nil {
+		t.Fatalf("ffprobe output: %v", err)
+	}
+	return &r
+}
+
+// Seconds parses an ffprobe decimal-seconds string; ok is false for "N/A".
+func Seconds(s string) (v float64, ok bool) {
+	v, err := strconv.ParseFloat(s, 64)
+	return v, err == nil
+}
+
+// Rotation returns the display-matrix rotation ffprobe reports (0 if none).
+func (s *Stream) Rotation() int {
+	for _, sd := range s.SideData {
+		if r, ok := sd["rotation"].(float64); ok {
+			return int(r)
+		}
+	}
+	return 0
+}
+
+// Ratio parses "a/b" or "a:b" into a float (0 when undefined).
+func Ratio(s string) float64 {
+	s = strings.ReplaceAll(s, ":", "/")
+	a, b, ok := strings.Cut(s, "/")
+	if !ok {
+		return 0
+	}
+	n, _ := strconv.ParseFloat(a, 64)
+	d, _ := strconv.ParseFloat(b, 64)
+	if d == 0 {
+		return 0
+	}
+	return n / d
+}
