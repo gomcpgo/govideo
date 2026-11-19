@@ -57,7 +57,7 @@ err := tl.Export(ctx, "out.mp4", govideo.ExportOptions{
 
 What works today:
 
-- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 and HEVC (8-bit and 10-bit, macOS only), Motion JPEG. Audio: AAC (macOS only), LPCM. Rotation metadata is applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins.
+- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo. Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
 - **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
 - **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
@@ -68,9 +68,9 @@ What works today:
   - `ProfileIntermediate`: Motion JPEG + 16-bit LPCM, using only native codecs, on every platform. The files are large; this is a format that editors and ffmpeg read, not a delivery format.
   - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
 
-Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames; captions cannot be burned in yet.
+Known limits: multichannel audio is mixed down with headroom, so 5.1 sources come out quieter than a stereo mix of the same material; HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames; captions cannot be burned in yet.
 
-Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. `govideo.Codecs()` lists what is usable.
+Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
 ## Codec policy
 
@@ -103,11 +103,13 @@ go test ./...
 
 Tests that compare against ffprobe or decode exports with ffmpeg skip themselves when those binaries are not installed, and tests of the system codecs skip where there are none. Test media is generated at test time and never committed.
 
-To check your own footage, point the suite at a folder of media files. Each file is exported with every available profile and the result is decoded by ffmpeg:
+To check your own footage, point the suite at a folder of media files. Each file is exported with every available profile and the picture is compared with ffmpeg's own decoding of the source:
 
 ```
 GOVIDEO_TEST_MEDIA=/path/to/videos go test . -run TestRealMedia -v
 ```
+
+The folder may instead hold the sub-folders `video/`, `audio/` (files for `AddAudio`; each must work or be refused as a missing codec), `stills/`, and `unsupported/` (files that must be refused with an error naming the codec or format).
 
 ## Licence
 

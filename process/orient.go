@@ -82,6 +82,14 @@ func applyOrientation(f *codec.VideoFrame, o int) *codec.VideoFrame {
 	return f
 }
 
+// FlipH mirrors a frame left to right, in place, and returns it.
+func FlipH(f *codec.VideoFrame) *codec.VideoFrame {
+	if f == nil {
+		return nil
+	}
+	return flipH(f)
+}
+
 // flipH mirrors a frame left-right in place and returns it.
 func flipH(f *codec.VideoFrame) *codec.VideoFrame {
 	flip := func(p []byte, stride, w, h int) {

@@ -21,6 +21,10 @@ type Sample struct {
 // PTS returns the composition time of the sample.
 func (s Sample) PTS() int64 { return s.DTS + int64(s.CTSOffset) }
 
+// ErrTruncated reports a sample that lies beyond the end of the file: the
+// index describes media that was never written or was cut off.
+var ErrTruncated = errors.New("isobmff: sample lies beyond the end of the file")
+
 // ErrBadSampleTable reports an inconsistent sample table.
 var ErrBadSampleTable = errors.New("isobmff: inconsistent sample table")
 
@@ -403,8 +407,11 @@ func (it *SampleIter) NextBlock(max int) (s Sample, count int, err error) {
 // returned by NextBlock) after validating the range against the file size.
 func (f *File) ReadSample(s Sample, count int, buf []byte) ([]byte, error) {
 	n := int64(s.Size) * int64(count)
-	if s.Offset < 0 || n < 0 || s.Offset+n > f.size || n > 1<<30 {
+	if s.Offset < 0 || n < 0 || n > 1<<30 {
 		return nil, ErrBadSampleTable
+	}
+	if s.Offset+n > f.size {
+		return nil, ErrTruncated
 	}
 	if int64(cap(buf)) < n {
 		buf = make([]byte, n)

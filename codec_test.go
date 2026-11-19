@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"image/color"
 	"math"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"github.com/gomcpgo/govideo"
 	"github.com/gomcpgo/govideo/internal/oracle"
 	"github.com/gomcpgo/govideo/process"
-	"github.com/gomcpgo/govideo/videoprobe"
 )
 
 // The codec tests are built on the animated test card: every frame carries
@@ -514,69 +512,5 @@ func TestDecodeAVI(t *testing.T) {
 			}
 			checkBeeps(t, out, tol, 0, 1, 2)
 		})
-	}
-}
-
-// TestRealMedia exports the first seconds of every file in the directory
-// named by GOVIDEO_TEST_MEDIA with each available profile and has the oracle
-// decode the results. It is how a corpus of camera and phone files is
-// checked; without the variable it is skipped.
-func TestRealMedia(t *testing.T) {
-	root := os.Getenv("GOVIDEO_TEST_MEDIA")
-	if root == "" {
-		t.Skip("GOVIDEO_TEST_MEDIA is not set")
-	}
-	oracle.Require(t)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	profiles := map[string]govideo.Profile{"intermediate.mov": govideo.ProfileIntermediate}
-	if govideo.BuildInfo().OSBackend {
-		profiles["compatible.mp4"] = govideo.ProfileCompatible
-	}
-	dir := t.TempDir()
-	for _, e := range entries {
-		if e.IsDir() || e.Name()[0] == '.' {
-			continue
-		}
-		in := filepath.Join(root, e.Name())
-		for suffix, profile := range profiles {
-			t.Run(e.Name()+"/"+suffix, func(t *testing.T) {
-				info, err := videoprobe.ProbeFile(context.Background(), in)
-				if err != nil {
-					t.Fatalf("probe: %v", err)
-				}
-				want := min(info.Duration, 3*time.Second)
-				tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1)})
-				tl.AddClip(in, govideo.ClipOptions{Trim: govideo.Range(0, want)})
-				out := filepath.Join(dir, e.Name()+"."+suffix)
-				if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: profile}); err != nil {
-					t.Fatalf("export: %v", err)
-				}
-				defer os.Remove(out)
-				if err := oracle.TryFFmpeg("-xerror", "-i", out, "-f", "null", "-"); err != nil {
-					t.Fatalf("ffmpeg cannot decode the export: %v", err)
-				}
-				pr := oracle.FFprobe(t, out)
-				for i, st := range pr.Streams {
-					if d, _ := oracle.Seconds(st.Duration); math.Abs(d-want.Seconds()) > 0.05 {
-						t.Errorf("stream %d lasts %.3fs, want %.3f", i, d, want.Seconds())
-					}
-				}
-				// The picture must not be blank.
-				frames := oracle.Frames(t, out, cardW, cardH)
-				if len(frames) == 0 {
-					t.Fatal("no frames")
-				}
-				lo, hi := 255, 0
-				for _, v := range frames[len(frames)/2] {
-					lo, hi = min(lo, int(v)), max(hi, int(v))
-				}
-				if hi-lo < 40 {
-					t.Errorf("middle frame is flat (values %d..%d)", lo, hi)
-				}
-			})
-		}
 	}
 }

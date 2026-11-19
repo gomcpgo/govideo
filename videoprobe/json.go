@@ -53,6 +53,9 @@ func (in *Info) JSON() ([]byte, error) {
 			o["avg_frame_rate"] = v.AvgFrameRate.String()
 			o["vfr"] = v.VFR
 			o["rotation"] = v.Rotation
+			if v.Mirrored {
+				o["mirrored"] = true
+			}
 			if v.BitDepth > 0 {
 				o["bits_per_raw_sample"] = fmt.Sprint(v.BitDepth)
 			}

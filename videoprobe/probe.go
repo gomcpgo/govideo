@@ -24,6 +24,71 @@ import (
 // ErrUnknownFormat reports a file whose container format is not recognised.
 var ErrUnknownFormat = errors.New("videoprobe: unrecognised container format")
 
+// UnsupportedFormatError reports a file whose format was recognised but is
+// not one this package reads. errors.Is(err, ErrUnknownFormat) is true for
+// it, so callers that only ask "can this be probed" need no change.
+type UnsupportedFormatError struct {
+	// Format is a short name: "mp3", "flac", "ogg", "ac3", "adts", "mpegts",
+	// "mxf", "heif", "asf" or "flv".
+	Format string
+}
+
+var unsupportedNames = map[string]string{
+	"mp3": "MP3", "flac": "FLAC", "ogg": "Ogg", "ac3": "raw AC-3", "adts": "raw AAC (ADTS)",
+	"mpegts": "MPEG transport stream", "mxf": "MXF", "heif": "HEIF/HEIC/AVIF image", "asf": "ASF/WMV", "flv": "FLV",
+}
+
+func (e *UnsupportedFormatError) Error() string {
+	return "videoprobe: " + unsupportedNames[e.Format] + " files are not supported"
+}
+
+// Is makes the error match ErrUnknownFormat.
+func (e *UnsupportedFormatError) Is(target error) bool { return target == ErrUnknownFormat }
+
+// sniffUnsupported names well-known formats that are not read, from the
+// first bytes of the file (and, for transport streams, the sync bytes of
+// the following packets).
+func sniffUnsupported(head []byte, r io.ReaderAt) string {
+	has := func(off int, s string) bool { return len(head) >= off+len(s) && string(head[off:off+len(s)]) == s }
+	at := func(off int64) byte {
+		var b [1]byte
+		if _, err := r.ReadAt(b[:], off); err != nil {
+			return 0
+		}
+		return b[0]
+	}
+	switch {
+	case has(4, "ftyp") && len(head) >= 12:
+		switch string(head[8:12]) {
+		case "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "avif", "avis":
+			return "heif"
+		}
+	case has(0, "fLaC"):
+		return "flac"
+	case has(0, "OggS"):
+		return "ogg"
+	case has(0, "ID3"):
+		return "mp3"
+	case has(0, "FLV\x01"):
+		return "flv"
+	case has(0, "\x30\x26\xb2\x75\x8e\x66\xcf\x11"):
+		return "asf"
+	case has(0, "\x06\x0e\x2b\x34\x02\x05\x01\x01"):
+		return "mxf"
+	case len(head) >= 2 && head[0] == 0x0b && head[1] == 0x77:
+		return "ac3"
+	case len(head) >= 1 && head[0] == 0x47 && at(188) == 0x47 && at(376) == 0x47:
+		return "mpegts"
+	case len(head) >= 5 && head[4] == 0x47 && at(196) == 0x47 && at(388) == 0x47:
+		return "mpegts" // 192-byte packets (M2TS, AVCHD)
+	case len(head) >= 2 && head[0] == 0xff && head[1]&0xf6 == 0xf0:
+		return "adts"
+	case len(head) >= 2 && head[0] == 0xff && head[1]&0xe0 == 0xe0 && head[1]&0x06 != 0:
+		return "mp3"
+	}
+	return ""
+}
+
 // Rational is a rational number (frame rates, aspect ratios, time bases).
 type Rational struct{ Num, Den int64 }
 
@@ -97,15 +162,18 @@ type VideoInfo struct {
 	FrameRate, AvgFrameRate Rational
 	VFR                     bool
 	Rotation                int // degrees clockwise to apply for display: 0, 90, 180, 270
-	BitDepth                int
-	Chroma                  string // "4:2:0", "4:2:2", "4:4:4"
-	Interlaced              bool
-	ColorPrimaries          string
-	ColorTransfer           string
-	ColorMatrix             string
-	ColorRange              string // "tv", "pc" or ""
-	HDR                     string // "", "hlg", "pq"
-	DolbyVision             *DolbyVisionInfo
+	// Mirrored reports a display matrix that reflects the picture: after
+	// rotating, flip it left to right.
+	Mirrored       bool
+	BitDepth       int
+	Chroma         string // "4:2:0", "4:2:2", "4:4:4"
+	Interlaced     bool
+	ColorPrimaries string
+	ColorTransfer  string
+	ColorMatrix    string
+	ColorRange     string // "tv", "pc" or ""
+	HDR            string // "", "hlg", "pq"
+	DolbyVision    *DolbyVisionInfo
 }
 
 // DolbyVisionInfo is the Dolby Vision configuration of a video stream.
@@ -147,6 +215,9 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 	}
 	head = head[:n]
 	var info *Info
+	if f := sniffUnsupported(head, r); f == "heif" {
+		return nil, &UnsupportedFormatError{Format: f} // would otherwise be taken for an MP4
+	}
 	switch {
 	case matroska.Sniff(head):
 		f, err := matroska.Open(ctx, r, size)
@@ -173,6 +244,9 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 		}
 		info = fromISOBMFF(f)
 	default:
+		if f := sniffUnsupported(head, r); f != "" {
+			return nil, &UnsupportedFormatError{Format: f}
+		}
 		return nil, ErrUnknownFormat
 	}
 	info.Size = size

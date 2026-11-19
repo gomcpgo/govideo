@@ -180,10 +180,12 @@ func Frames(t testing.TB, path string, w, h int) [][]byte {
 }
 
 // Audio decodes an audio stream of path (for example "0:a:0") to mono
-// float32 samples at 48 kHz, honouring edit lists as a player would.
-func Audio(t testing.TB, path, stream string) []float32 {
+// float32 samples at 48 kHz, honouring edit lists as a player would. Extra
+// output arguments (a filter, say) may be given.
+func Audio(t testing.TB, path, stream string, extra ...string) []float32 {
 	t.Helper()
-	raw := FFmpegOutput(t, "-i", path, "-map", stream, "-ac", "1", "-ar", "48000", "-f", "f32le", "-")
+	args := append([]string{"-i", path, "-map", stream}, extra...)
+	raw := FFmpegOutput(t, append(args, "-ac", "1", "-ar", "48000", "-f", "f32le", "-")...)
 	out := make([]float32, len(raw)/4)
 	for i := range out {
 		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))
