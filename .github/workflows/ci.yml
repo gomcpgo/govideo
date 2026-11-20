@@ -8,7 +8,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-13, windows-latest, ubuntu-latest, ubuntu-24.04-arm]
+        os: [macos-latest, macos-15-intel, windows-latest, ubuntu-latest, ubuntu-24.04-arm]
         variant: [default, simd, purego]
     runs-on: ${{ matrix.os }}
     env:

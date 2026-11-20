@@ -29,14 +29,15 @@ func needOracle(t *testing.T) {
 
 // generate runs ffmpeg and returns the output path. With optional set, an
 // encoder failure skips the test (hardware/OS encoders are not always
-// usable).
+// usable). An ffmpeg built without the encoder skips it in any case: the
+// smaller Windows builds have no AV1 encoder, for one.
 func generate(t *testing.T, optional bool, out string, args ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), out)
 	full := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)
 	full = append(full, path)
 	if b, err := exec.Command("ffmpeg", full...).CombinedOutput(); err != nil {
-		if optional {
+		if optional || bytes.Contains(b, []byte("Unknown encoder")) {
 			t.Skipf("ffmpeg could not produce fixture: %v\n%s", err, b)
 		}
 		t.Fatalf("ffmpeg %s: %v\n%s", strings.Join(full, " "), err, b)
@@ -467,7 +468,12 @@ func compareAudio(t *testing.T, a *Audio, p probeStream, skipProfile bool) {
 	if a.Channels != p.Channels {
 		t.Errorf("channels %d, ffprobe %d", a.Channels, p.Channels)
 	}
-	if a.ChannelLayout != p.ChannelLayout {
+	// AAC channel configuration 7 is the layout with two extra front
+	// speakers (ISO/IEC 14496-3 table 1.19), "7.1(wide)". ffmpeg 8 writes
+	// it for a 7.1 input and calls it "7.1"; ffmpeg 9 writes configuration
+	// 12 for 7.1. Both are accepted for configuration 7.
+	old71 := a.Codec == "aac" && a.ChannelLayout == "7.1(wide)" && p.ChannelLayout == "7.1"
+	if a.ChannelLayout != p.ChannelLayout && !old71 {
 		t.Errorf("layout %q, ffprobe %q", a.ChannelLayout, p.ChannelLayout)
 	}
 }
