@@ -26,11 +26,25 @@ type VideoConfig struct {
 }
 
 // EncodeConfig describes an H.264 encode.
+//
+// Rate control is chosen by Quality and Bitrate. Quality alone asks for a
+// constant picture quality and lets the size follow the content. Bitrate
+// alone asks for a long-term average rate. MaxBitrate may be added to either
+// as a ceiling.
 type EncodeConfig struct {
 	Width, Height      int
 	FrameNum, FrameDen int64 // frame rate
-	Bitrate            int   // average bits per second
-	KeyInterval        int   // maximum frames between keyframes
+	// Quality, above 0 and up to 1, is the quality the encoder holds; 0
+	// leaves rate control to Bitrate.
+	Quality float64
+	Bitrate int // average bits per second; 0 = no target
+	// MaxBitrate is a hard limit on the bits in any one second; 0 = none.
+	MaxBitrate  int
+	KeyInterval int // maximum frames between keyframes
+	// Reorder lets the encoder use B-frames. Samples then come out in decode
+	// order, which differs from presentation order: EncodedFrame.Index tells
+	// them apart, and the container needs composition offsets.
+	Reorder bool
 }
 
 // AudioConfig describes a compressed audio stream to decode.

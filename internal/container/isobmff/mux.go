@@ -40,8 +40,9 @@ type muxTrack struct {
 	duration  uint64
 	sizes     []uint32
 	stts      []run
-	ctts      []run
+	ctts      []run // value holds a signed offset
 	hasCTS    bool
+	minCTS    int32 // the most negative composition offset written (<= 0)
 	sync      []uint32
 	chunkOffs []int64
 	editStart int64  // media time presentation starts at (elst), when hasEdit
@@ -102,6 +103,23 @@ func (t *muxTrack) presented() uint64 {
 	return t.duration
 }
 
+// ctsShift is the number of ticks by which every composition time is moved
+// later so that no composition offset is negative. A stream with B-frames
+// has samples that are shown before their decode position; ctts version 0,
+// the form every player reads, cannot say that, so the offsets are raised by
+// the largest lead and the edit list starts the presentation that much later.
+func (t *muxTrack) ctsShift() int64 { return -int64(t.minCTS) }
+
+// edit returns the track's edit: the media time presentation starts at and
+// the media ticks presented.
+func (t *muxTrack) edit() (start int64, dur uint64, ok bool) {
+	shift := t.ctsShift()
+	if t.hasEdit {
+		return t.editStart + shift, t.editDur, true
+	}
+	return shift, t.duration, shift != 0
+}
+
 func appendRun(r []run, v uint32, n uint32) []run {
 	if k := len(r); k > 0 && r[k-1].value == v && uint64(r[k-1].count)+uint64(n) <= 0xffffffff {
 		r[k-1].count += n
@@ -111,7 +129,9 @@ func appendRun(r []run, v uint32, n uint32) []run {
 }
 
 // WriteSample appends a sample to a track. dur is in the track timescale and
-// ctsOffset is the composition offset. Samples should be written in
+// ctsOffset is the composition offset: presentation time less decode time,
+// which is negative for a sample shown before its place in decode order (see
+// ctsShift for how that is written). Samples should be written in
 // interleaved order; consecutive samples of one track share a chunk. For
 // constant-size tracks data may hold several samples and dur, sync and
 // ctsOffset are ignored.
@@ -152,6 +172,7 @@ func (m *Muxer) WriteSample(track int, data []byte, dur uint32, sync bool, ctsOf
 		if ctsOffset != 0 {
 			t.hasCTS = true
 		}
+		t.minCTS = min(t.minCTS, ctsOffset)
 		t.ctts = appendRun(t.ctts, uint32(ctsOffset), 1)
 	}
 	t.stts = appendRun(t.stts, dur, n)
@@ -301,13 +322,13 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 					b.u32(uint32(cfg.Width) << 16)
 					b.u32(uint32(cfg.Height) << 16)
 				})
-				if t.hasEdit {
+				if start, dur, ok := t.edit(); ok {
 					b.box("edts", func() {
 						b.box("elst", func() {
 							b.u32(0)
 							b.u32(1)
-							b.u32(uint32(scaleDur(t.editDur, cfg.Timescale)))
-							b.u32(uint32(t.editStart))
+							b.u32(uint32(scaleDur(dur, cfg.Timescale)))
+							b.u32(uint32(start))
 							b.u32(0x10000) // rate 1.0
 						})
 					})
@@ -406,11 +427,11 @@ func (m *Muxer) buildStbl(b *buf, t *muxTrack, base int64, co64 bool) {
 	})
 	if t.hasCTS {
 		b.box("ctts", func() {
-			b.u32(1 << 24) // version 1: signed offsets
+			b.u32(0) // version 0: unsigned offsets
 			b.u32(uint32(len(t.ctts)))
 			for _, r := range t.ctts {
 				b.u32(r.count)
-				b.u32(r.value)
+				b.u32(uint32(int64(int32(r.value)) + t.ctsShift()))
 			}
 		})
 	}

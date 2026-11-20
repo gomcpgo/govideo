@@ -149,3 +149,42 @@ func FuzzOpen(f *testing.F) {
 		}
 	})
 }
+
+// TestMuxReorderedSamples writes a B-frame stream: samples in decode order,
+// some shown before their decode position. The offsets must come back
+// non-negative, with an edit that starts the presentation at the first
+// frame shown, so that presentation times still run 0, 1, 2, ...
+func TestMuxReorderedSamples(t *testing.T) {
+	const dur = 1001
+	order := []int{0, 4, 2, 1, 3, 8, 6, 5, 7, 9} // presentation index, in decode order
+	m := NewMuxer(BrandMP4, &memFile{})
+	v := m.AddTrack(TrackConfig{Handler: "vide", Timescale: 30000, Entry: VisualEntry("avc1", 64, 48, ""), Width: 64, Height: 48})
+	for pos, shown := range order {
+		if err := m.WriteSample(v, []byte{byte(shown)}, dur, pos == 0, int32(shown-pos)*dur); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var out bytes.Buffer
+	if err := m.Finish(&out); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Open(context.Background(), bytes.NewReader(out.Bytes()), int64(out.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := f.Tracks[0]
+	// The earliest lead is two frames (sample 3 shows frame 1).
+	if len(tr.Edits) != 1 || tr.Edits[0].MediaTime != 2*dur || tr.Edits[0].SegmentDuration != 334 {
+		t.Fatalf("edits %+v, want one starting at media time %d and lasting 334 ms", tr.Edits, 2*dur)
+	}
+	it := tr.Iter()
+	for pos, shown := range order {
+		s, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.CTSOffset < 0 || s.PTS()-tr.Edits[0].MediaTime != int64(shown)*dur {
+			t.Errorf("sample %d: offset %d, presented at %d, want %d", pos, s.CTSOffset, s.PTS()-tr.Edits[0].MediaTime, shown*dur)
+		}
+	}
+}

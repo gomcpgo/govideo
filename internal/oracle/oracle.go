@@ -44,6 +44,20 @@ func TryFFmpeg(args ...string) error {
 	return nil
 }
 
+// FFmpegLog runs ffmpeg at the "info" log level and returns what it wrote to
+// standard error, failing the test on error. Filters that measure (psnr,
+// ssim, libvmaf) report there.
+func FFmpegLog(t testing.TB, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "info", "-nostats", "-nostdin"}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ffmpeg %s: %v: %s", strings.Join(args, " "), err, stderr.String())
+	}
+	return stderr.String()
+}
+
 type runError struct {
 	err    error
 	stderr string
@@ -66,6 +80,7 @@ type Stream struct {
 	SAR           string            `json:"sample_aspect_ratio"`
 	DAR           string            `json:"display_aspect_ratio"`
 	PixFmt        string            `json:"pix_fmt"`
+	HasBFrames    int               `json:"has_b_frames"`
 	FieldOrder    string            `json:"field_order"`
 	RFrameRate    string            `json:"r_frame_rate"`
 	AvgFrameRate  string            `json:"avg_frame_rate"`

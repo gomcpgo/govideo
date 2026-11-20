@@ -64,11 +64,11 @@ What works today:
 - **Audio** from WAV files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
 - **Captions** from SRT or WebVTT as a soft subtitle track (`tx3g`), with an optional `.vtt` sidecar for web players.
 - **Export**, with the index at the front of the file (faststart), in `.mp4` or `.mov`:
-  - `ProfileCompatible`: H.264 High + AAC-LC, tagged BT.709. macOS only for now. `Quality`, or explicit `VideoBitrate` and `AudioBitrate`, set the size.
+  - `ProfileCompatible`: H.264 High + AAC-LC, tagged BT.709. macOS only for now. Video is encoded to a picture quality chosen by `Quality`, so the size follows the content: a slide show comes out small, a busy scene keeps its detail and takes what it needs. Set `VideoBitrate` when you need a predictable size instead (the two cannot be combined: the system encoder has no quality mode with a ceiling). `AudioBitrate` sets the audio rate.
   - `ProfileIntermediate`: Motion JPEG + 16-bit LPCM, using only native codecs, on every platform. The files are large; this is a format that editors and ffmpeg read, not a delivery format.
   - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
 
-Known limits: multichannel audio is mixed down with headroom, so 5.1 sources come out quieter than a stereo mix of the same material; HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames; captions cannot be burned in yet.
+Known limits: multichannel audio is mixed down with headroom, so 5.1 sources come out quieter than a stereo mix of the same material; HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
 Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
@@ -108,6 +108,8 @@ To check your own footage, point the suite at a folder of media files. Each file
 ```
 GOVIDEO_TEST_MEDIA=/path/to/videos go test . -run TestRealMedia -v
 ```
+
+`TestMeasureH264` (see its comment) encodes the same folder with a range of encoder settings and writes size, PSNR, SSIM and VMAF for each to a CSV file. It is how the encoder defaults were chosen.
 
 The folder may instead hold the sub-folders `video/`, `audio/` (files for `AddAudio`; each must work or be refused as a missing codec), `stills/`, and `unsupported/` (files that must be refused with an error naming the codec or format).
 
