@@ -21,6 +21,7 @@ var (
 	cfStringCreateWithCString func(alloc uintptr, s string, encoding uint32) uintptr
 	cfEqual                   func(a, b uintptr) bool
 	cfArrayGetValueAtIndex    func(array uintptr, i int) uintptr
+	cfArrayCreate             func(alloc uintptr, values unsafe.Pointer, n int, cb uintptr) uintptr
 
 	cmVideoFormatDescriptionCreate     func(alloc uintptr, codec uint32, width, height int32, extensions uintptr, out *uintptr) int32
 	cmBlockBufferCreateWithMemoryBlock func(alloc, block uintptr, blockLen int, blockAlloc, source uintptr, offset, dataLen int, flags uint32, out *uintptr) int32
@@ -68,6 +69,7 @@ var (
 // Constants read from the frameworks (CFString and CFBoolean objects).
 var k struct {
 	dictKeyCB, dictValueCB uintptr
+	arrayCB                uintptr
 	cfTrue, cfFalse        uintptr
 
 	atoms, notSync                             uintptr
@@ -78,6 +80,7 @@ var k struct {
 	realTime, profileLevel, highAuto           uintptr
 	reorder, keyInterval, bitRate, expectedFPS uintptr
 	vtPrimaries, vtTransfer, vtMatrix          uintptr
+	quality, rateLimits                        uintptr
 }
 
 // cmTime mirrors CMTime.
@@ -129,6 +132,7 @@ func load() (err error) {
 	bind(&cfStringCreateWithCString, cf, "CFStringCreateWithCString")
 	bind(&cfEqual, cf, "CFEqual")
 	bind(&cfArrayGetValueAtIndex, cf, "CFArrayGetValueAtIndex")
+	bind(&cfArrayCreate, cf, "CFArrayCreate")
 
 	bind(&cmVideoFormatDescriptionCreate, cm, "CMVideoFormatDescriptionCreate")
 	bind(&cmBlockBufferCreateWithMemoryBlock, cm, "CMBlockBufferCreateWithMemoryBlock")
@@ -186,6 +190,7 @@ func load() (err error) {
 	}
 	k.dictKeyCB = addr(cf, "kCFTypeDictionaryKeyCallBacks")
 	k.dictValueCB = addr(cf, "kCFTypeDictionaryValueCallBacks")
+	k.arrayCB = addr(cf, "kCFTypeArrayCallBacks")
 	k.cfTrue = value(cf, "kCFBooleanTrue")
 	k.cfFalse = value(cf, "kCFBooleanFalse")
 	k.atoms = value(cm, "kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms")
@@ -206,6 +211,8 @@ func load() (err error) {
 	k.reorder = value(vt, "kVTCompressionPropertyKey_AllowFrameReordering")
 	k.keyInterval = value(vt, "kVTCompressionPropertyKey_MaxKeyFrameInterval")
 	k.bitRate = value(vt, "kVTCompressionPropertyKey_AverageBitRate")
+	k.quality = value(vt, "kVTCompressionPropertyKey_Quality")
+	k.rateLimits = value(vt, "kVTCompressionPropertyKey_DataRateLimits")
 	k.expectedFPS = value(vt, "kVTCompressionPropertyKey_ExpectedFrameRate")
 	k.vtPrimaries = value(vt, "kVTCompressionPropertyKey_ColorPrimaries")
 	k.vtTransfer = value(vt, "kVTCompressionPropertyKey_TransferFunction")
@@ -221,6 +228,17 @@ func load() (err error) {
 func cfInt(v int32) uintptr {
 	const kCFNumberSInt32Type = 3
 	return cfNumberCreate(0, kCFNumberSInt32Type, unsafe.Pointer(&v))
+}
+
+// cfFloat returns a new CFNumber holding v.
+func cfFloat(v float64) uintptr {
+	const kCFNumberFloat64Type = 6
+	return cfNumberCreate(0, kCFNumberFloat64Type, unsafe.Pointer(&v))
+}
+
+// cfArray returns a new CFArray of the given objects, retaining them.
+func cfArray(values ...uintptr) uintptr {
+	return cfArrayCreate(0, unsafe.Pointer(&values[0]), len(values), k.arrayCB)
 }
 
 // cfDict returns a new CFDictionary of the given key/value pairs, retaining

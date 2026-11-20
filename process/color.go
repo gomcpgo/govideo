@@ -204,11 +204,21 @@ func fromGray(m *image.Gray) *codec.VideoFrame {
 
 // fromYCbCr handles Go's JPEG-style Y'CbCr (BT.601, full range) at any
 // chroma subsampling by resampling chroma to 4:2:0 and converting the matrix.
-func fromYCbCr(m *image.YCbCr) *codec.VideoFrame {
+func fromYCbCr(m *image.YCbCr) *codec.VideoFrame { return convertYCbCr(m, true) }
+
+// FromVideoYCbCr converts a Y'CbCr image whose samples are BT.601 limited
+// range (16..235), as lossy WebP stores them. Go's image.YCbCr type has no
+// way to say so, and FromImage assumes the full range JPEG uses.
+func FromVideoYCbCr(m *image.YCbCr) *codec.VideoFrame { return convertYCbCr(m, false) }
+
+func convertYCbCr(m *image.YCbCr, fullRange bool) *codec.VideoFrame {
 	b := m.Bounds()
 	w, h := b.Dx(), b.Dy()
 	f := codec.NewVideoFrame(w, h)
-	f.Matrix, f.FullRange = 6, true
+	if w <= 0 || h <= 0 {
+		return f
+	}
+	f.Matrix, f.FullRange = 6, fullRange
 	for y := 0; y < h; y++ {
 		o := m.YOffset(b.Min.X, b.Min.Y+y)
 		copy(f.Y[y*f.YStride:y*f.YStride+w], m.Y[o:o+w])

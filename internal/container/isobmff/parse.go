@@ -43,6 +43,7 @@ type File struct {
 	CreationTime     time.Time
 	Tracks           []*Track
 	Tags             map[string]string
+	Gapless          *Gapless // iTunes gapless information, nil if absent
 	MdatBytes        int64
 
 	r         io.ReaderAt

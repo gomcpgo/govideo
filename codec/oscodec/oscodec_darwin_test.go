@@ -3,6 +3,7 @@
 package oscodec
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -225,5 +226,118 @@ func TestSessionsAreReleased(t *testing.T) {
 	}
 	if after := len(handles); after != before {
 		t.Errorf("handle registry grew from %d to %d", before, after)
+	}
+}
+
+// TestH264Reorder encodes with B-frames allowed: the samples come out in
+// decode order, each frame exactly once, and decode back to the pictures
+// that went in.
+func TestH264Reorder(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	const w, h, count = 320, 240, 60
+	enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Bitrate: 1_000_000, Reorder: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	var packets []codec.EncodedFrame
+	for n := 0; n < count; n++ {
+		out, err := enc.Encode(gradientFrame(w, h, n))
+		if err != nil {
+			t.Fatalf("encode frame %d: %v", n, err)
+		}
+		packets = append(packets, out...)
+	}
+	out, err := enc.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	packets = append(packets, out...)
+	seen, reordered := make([]bool, count), false
+	for i, p := range packets {
+		if p.Index < 0 || p.Index >= count || seen[p.Index] {
+			t.Fatalf("packet %d carries frame %d (out of range or repeated)", i, p.Index)
+		}
+		seen[p.Index] = true
+		reordered = reordered || p.Index != int64(i)
+	}
+	if len(packets) != count {
+		t.Fatalf("%d packets for %d frames", len(packets), count)
+	}
+	if !reordered {
+		t.Error("the encoder used no B-frames although reordering was allowed")
+	}
+	dec, err := NewVideoDecoder(VideoConfig{Codec: "h264", Width: w, Height: h, Record: enc.Config(), Matrix: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	var frames []codec.TimedFrame
+	for i, p := range packets {
+		got, err := dec.Decode(p.Data, time.Duration(p.Index)*time.Second/30)
+		if err != nil {
+			t.Fatalf("decode packet %d: %v", i, err)
+		}
+		frames = append(frames, got...)
+	}
+	rest, err := dec.Flush()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if frames = append(frames, rest...); len(frames) != count {
+		t.Fatalf("decoded %d frames, want %d", len(frames), count)
+	}
+	for _, f := range frames {
+		want := gradientFrame(w, h, int((f.PTS*30+time.Second/2)/time.Second))
+		var sum float64
+		for j := range want.Y {
+			d := float64(want.Y[j]) - float64(f.Frame.Y[j])
+			sum += d * d
+		}
+		if psnr := 10 * math.Log10(255*255/(sum/float64(len(want.Y))+1e-9)); psnr < 32 {
+			t.Errorf("frame at %v: luma PSNR %.1f dB", f.PTS, psnr)
+		}
+	}
+}
+
+// TestH264Quality checks that the quality setting steers the size and that
+// impossible settings are refused.
+func TestH264Quality(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	const w, h = 320, 240
+	size := func(q float64) (n int) {
+		enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Quality: q})
+		if errors.Is(err, ErrNoQualityMode) {
+			t.Skip(err)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer enc.Close()
+		for i := 0; i <= 30; i++ {
+			var out []codec.EncodedFrame
+			if i < 30 {
+				out, err = enc.Encode(gradientFrame(w, h, i))
+			} else {
+				out, err = enc.Flush()
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, p := range out {
+				n += len(p.Data)
+			}
+		}
+		return n
+	}
+	if low, high := size(0.3), size(0.8); 2*high < 3*low {
+		t.Errorf("quality 0.8 gave %d bytes and quality 0.3 gave %d: the setting has little effect", high, low)
+	}
+	if _, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Quality: 1.5}); err == nil {
+		t.Error("quality 1.5 was accepted")
 	}
 }

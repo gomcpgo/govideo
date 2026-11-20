@@ -36,6 +36,61 @@ func (f *File) parseUdta(b []byte) {
 	})
 }
 
+// Gapless is the iTunes gapless playback information of an audio file
+// (the "iTunSMPB" freeform tag): how many leading sample frames are encoder
+// priming, how many trailing ones are padding, and how many are real.
+type Gapless struct {
+	Priming, Padding uint32
+	Samples          uint64
+}
+
+// parseFreeform reads an iTunes "----" item (mean, name, data). Only the
+// gapless tag is used; it is how files without an edit list mark priming.
+func (f *File) parseFreeform(item []byte) {
+	var name, data string
+	walk(item, func(typ string, d []byte) error {
+		switch {
+		case typ == "name" && len(d) >= 4 && len(d) < 64:
+			name = string(d[4:])
+		case typ == "data" && len(d) >= 8 && len(d) < 512:
+			data = string(d[8:])
+		}
+		return nil
+	})
+	if name != "iTunSMPB" || f.Gapless != nil {
+		return
+	}
+	// " 00000000 00000800 00000240 0000000000005DC0 ...": hexadecimal fields.
+	fields := strings.Fields(data)
+	if len(fields) < 4 {
+		return
+	}
+	hex := func(s string) (v uint64, ok bool) {
+		if len(s) == 0 || len(s) > 16 {
+			return 0, false
+		}
+		for _, c := range []byte(s) {
+			switch {
+			case c >= '0' && c <= '9':
+				v = v<<4 | uint64(c-'0')
+			case c >= 'a' && c <= 'f':
+				v = v<<4 | uint64(c-'a'+10)
+			case c >= 'A' && c <= 'F':
+				v = v<<4 | uint64(c-'A'+10)
+			default:
+				return 0, false
+			}
+		}
+		return v, true
+	}
+	pr, ok1 := hex(fields[1])
+	pad, ok2 := hex(fields[2])
+	n, ok3 := hex(fields[3])
+	if ok1 && ok2 && ok3 && pr < 1<<20 && pad < 1<<20 {
+		f.Gapless = &Gapless{Priming: uint32(pr), Padding: uint32(pad), Samples: n}
+	}
+}
+
 // parseMeta handles both the ISO form (FullBox) and the QuickTime form (no
 // version/flags), with iTunes-style 'ilst' or QuickTime 'keys' + 'ilst'.
 func (f *File) parseMeta(b []byte) {
@@ -60,6 +115,10 @@ func (f *File) parseMeta(b []byte) {
 			}
 		case "ilst":
 			walk(p, func(typ string, item []byte) error {
+				if typ == "----" {
+					f.parseFreeform(item)
+					return nil
+				}
 				name := udtaNames[typ]
 				if len(keys) > 0 {
 					if idx := int(be.Uint32([]byte(typ))); idx >= 1 && idx <= len(keys) {

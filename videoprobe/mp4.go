@@ -188,7 +188,7 @@ func mp4Video(s *Stream, t *isobmff.Track, e *isobmff.SampleEntry) {
 		vi.AvgFrameRate = reduceBig(t.SampleCount, ts, int64(t.MediaDuration))
 	}
 	vi.VFR = t.VariableRate
-	vi.Rotation = matrixRotation(t.Matrix)
+	vi.Rotation, vi.Mirrored = matrixRotation(t.Matrix)
 
 	c := colourOf(hv)
 	if prim, trc, mat, full, ok := codechdr.ParseColr(e.Boxes["colr"]); ok {
@@ -224,15 +224,21 @@ func reduceBig(a, b, c int64) Rational {
 }
 
 // matrixRotation returns the clockwise display rotation encoded in a tkhd
-// matrix, rounded to a multiple of 90 degrees.
-func matrixRotation(m [9]int32) int {
+// matrix, rounded to a multiple of 90 degrees, and whether the matrix also
+// reflects the picture. A reflecting matrix (negative determinant) is read
+// as the rotation followed by a left-right flip.
+func matrixRotation(m [9]int32) (rotation int, mirrored bool) {
 	a, b := float64(m[0]), float64(m[1])
+	c, d := float64(m[3]), float64(m[4])
 	if a == 0 && b == 0 {
-		return 0
+		return 0, false
+	}
+	if mirrored = a*d-b*c < 0; mirrored {
+		a = -a // undo the flip to leave the rotation
 	}
 	deg := math.Atan2(b, a) * 180 / math.Pi
 	r := int(math.Round(deg/90)) * 90
-	return ((r % 360) + 360) % 360
+	return ((r % 360) + 360) % 360, mirrored
 }
 
 func mp4Audio(s *Stream, f *isobmff.File, e *isobmff.SampleEntry) {

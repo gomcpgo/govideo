@@ -44,6 +44,20 @@ func TryFFmpeg(args ...string) error {
 	return nil
 }
 
+// FFmpegLog runs ffmpeg at the "info" log level and returns what it wrote to
+// standard error, failing the test on error. Filters that measure (psnr,
+// ssim, libvmaf) report there.
+func FFmpegLog(t testing.TB, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("ffmpeg", append([]string{"-hide_banner", "-loglevel", "info", "-nostats", "-nostdin"}, args...)...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ffmpeg %s: %v: %s", strings.Join(args, " "), err, stderr.String())
+	}
+	return stderr.String()
+}
+
 type runError struct {
 	err    error
 	stderr string
@@ -66,6 +80,7 @@ type Stream struct {
 	SAR           string            `json:"sample_aspect_ratio"`
 	DAR           string            `json:"display_aspect_ratio"`
 	PixFmt        string            `json:"pix_fmt"`
+	HasBFrames    int               `json:"has_b_frames"`
 	FieldOrder    string            `json:"field_order"`
 	RFrameRate    string            `json:"r_frame_rate"`
 	AvgFrameRate  string            `json:"avg_frame_rate"`
@@ -180,10 +195,12 @@ func Frames(t testing.TB, path string, w, h int) [][]byte {
 }
 
 // Audio decodes an audio stream of path (for example "0:a:0") to mono
-// float32 samples at 48 kHz, honouring edit lists as a player would.
-func Audio(t testing.TB, path, stream string) []float32 {
+// float32 samples at 48 kHz, honouring edit lists as a player would. Extra
+// output arguments (a filter, say) may be given.
+func Audio(t testing.TB, path, stream string, extra ...string) []float32 {
 	t.Helper()
-	raw := FFmpegOutput(t, "-i", path, "-map", stream, "-ac", "1", "-ar", "48000", "-f", "f32le", "-")
+	args := append([]string{"-i", path, "-map", stream}, extra...)
+	raw := FFmpegOutput(t, append(args, "-ac", "1", "-ar", "48000", "-f", "f32le", "-")...)
 	out := make([]float32, len(raw)/4)
 	for i := range out {
 		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[i*4:]))

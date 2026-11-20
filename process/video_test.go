@@ -508,3 +508,25 @@ func TestOrient(t *testing.T) {
 		}
 	}
 }
+
+// Lossy WebP stores limited-range BT.601 samples in an image.YCbCr; they
+// must not be stretched as if they were JPEG's full range.
+func TestFromVideoYCbCr(t *testing.T) {
+	m := image.NewYCbCr(image.Rect(0, 0, 8, 8), image.YCbCrSubsampleRatio420)
+	for i := range m.Y {
+		m.Y[i] = 235 // limited-range white
+	}
+	for i := range m.Cb {
+		m.Cb[i], m.Cr[i] = 128, 128
+	}
+	f := FromVideoYCbCr(m)
+	if f.Y[0] != 235 || f.FullRange || f.Matrix != 1 {
+		t.Errorf("limited-range white became Y=%d (full range %v, matrix %d), want 235 unchanged", f.Y[0], f.FullRange, f.Matrix)
+	}
+	if g := FromImage(m); g.Y[0] >= 235 {
+		t.Errorf("the same samples read as full range gave Y=%d; expected a darker value", g.Y[0])
+	}
+	if e := FromVideoYCbCr(image.NewYCbCr(image.Rect(0, 0, 0, 0), image.YCbCrSubsampleRatio420)); e.Width != 0 {
+		t.Error("empty image")
+	}
+}

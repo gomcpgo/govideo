@@ -112,7 +112,8 @@ type atDecoder struct {
 	rate, channels int
 	maxFrames      int
 	in, out, desc  cbuf
-	pending        int // bytes of the packet waiting in d.in
+	pending        int   // bytes of the packet waiting in d.in
+	order          []int // channel reordering, nil for none
 }
 
 // NewAudioDecoder returns an AudioToolbox decoder for an AAC stream (AAC-LC,
@@ -132,7 +133,13 @@ func NewAudioDecoder(c AudioConfig) (codec.AudioDecoder, error) {
 	if len(c.Config) >= 2 {
 		// AudioSpecificConfig (ISO/IEC 14496-3 §1.6.2.1): object type, then
 		// the sampling frequency index of the core coder.
-		switch aot := c.Config[0] >> 3; aot {
+		aot := int(c.Config[0] >> 3)
+		if aot == 31 { // escape: the type is 32 plus the next six bits
+			aot = 32 + int(c.Config[0]&7)<<3 | int(c.Config[1]>>5)
+		}
+		switch aot {
+		case 42: // USAC (xHE-AAC)
+			in.FormatID, in.FormatFlags = fourCC("usac"), 0
 		case 5:
 			in.FormatID, in.FormatFlags, in.FramesPerPacket = fourCC("aach"), 0, 2048
 		case 29:
@@ -144,12 +151,13 @@ func NewAudioDecoder(c AudioConfig) (codec.AudioDecoder, error) {
 			}
 		}
 	}
-	d := &atDecoder{rate: int(in.SampleRate), channels: c.Channels, maxFrames: 2 * int(in.FramesPerPacket)}
+	d := &atDecoder{rate: int(in.SampleRate), channels: c.Channels, maxFrames: 2 * int(in.FramesPerPacket),
+		order: aacChannelOrder[c.Channels]}
 	out := pcmFormat(d.rate, d.channels)
 	if st := audioConverterNew(&in, &out, &d.conv); st != 0 {
 		return nil, osErr("opening the AAC decoder", st)
 	}
-	if len(c.Config) > 0 && len(c.Config) < 64 {
+	if len(c.Config) > 0 && len(c.Config) <= 4096 {
 		cookie := esDescriptor(c.Config)
 		audioConverterSetProperty(d.conv, propDecoderCookie, uint32(len(cookie)), unsafe.Pointer(&cookie[0]))
 	}
@@ -162,11 +170,34 @@ func NewAudioDecoder(c AudioConfig) (codec.AudioDecoder, error) {
 // esDescriptor wraps an AudioSpecificConfig in an MPEG-4 ES_Descriptor
 // (ISO/IEC 14496-1 §7.2.6.5), the form AudioToolbox takes as a magic cookie.
 func esDescriptor(asc []byte) []byte {
-	dsi := append([]byte{5, byte(len(asc))}, asc...)
-	dcd := append([]byte{4, byte(13 + len(dsi)), 0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, dsi...)
-	sl := []byte{6, 1, 2}
-	es := append([]byte{3, byte(3 + len(dcd) + len(sl)), 0, 0, 0}, dcd...)
-	return append(es, sl...)
+	// Descriptor sizes use the four-byte form, so any length fits.
+	desc := func(tag byte, body ...[]byte) []byte {
+		n := 0
+		for _, b := range body {
+			n += len(b)
+		}
+		out := []byte{tag, byte(n>>21) | 0x80, byte(n>>14) | 0x80, byte(n>>7) | 0x80, byte(n & 0x7f)}
+		for _, b := range body {
+			out = append(out, b...)
+		}
+		return out
+	}
+	// DecoderConfigDescriptor: MPEG-4 audio (0x40), audio stream (0x15),
+	// buffer size and bit rates unknown.
+	dcd := desc(4, []byte{0x40, 0x15, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, desc(5, asc))
+	return desc(3, []byte{0, 0, 0}, dcd, desc(6, []byte{2}))
+}
+
+// aacChannelOrder maps, per channel count, each output position in the
+// conventional order (L R C LFE Ls Rs, then extra front or side pairs) to
+// its position in the order AAC codes the channels (centre first, LFE last:
+// ISO/IEC 14496-3 Table 1.19), which is the order the decoder delivers.
+var aacChannelOrder = map[int][]int{
+	3: {1, 2, 0},                // C L R
+	4: {1, 2, 0, 3},             // C L R Cs
+	5: {1, 2, 0, 3, 4},          // C L R Ls Rs
+	6: {1, 2, 0, 5, 3, 4},       // C L R Ls Rs LFE
+	8: {3, 4, 0, 7, 5, 6, 1, 2}, // C Lc Rc L R Ls Rs LFE
 }
 
 func (d *atDecoder) supply(packets *uint32, data *audioBufferList, desc *unsafe.Pointer) uintptr {
@@ -209,7 +240,16 @@ func (d *atDecoder) Decode(p []byte) (*codec.AudioFrame, error) {
 			return nil, osErr("decoding an AAC packet", st)
 		}
 		if n := int(frames) * d.channels; n > 0 {
-			fr.Samples = append(fr.Samples, unsafe.Slice((*float32)(d.out.p), n)...)
+			src := unsafe.Slice((*float32)(d.out.p), n)
+			if d.order == nil {
+				fr.Samples = append(fr.Samples, src...)
+			} else {
+				for i := 0; i < n; i += d.channels {
+					for _, from := range d.order {
+						fr.Samples = append(fr.Samples, src[i+from])
+					}
+				}
+			}
 		}
 		if st == noMoreInput || frames == 0 {
 			return fr, nil

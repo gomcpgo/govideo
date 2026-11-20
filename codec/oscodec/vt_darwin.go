@@ -240,8 +240,8 @@ type vtEncoder struct {
 }
 
 // NewH264Encoder returns a VideoToolbox H.264 High profile encoder. Frames
-// must be BT.709 limited range with even dimensions. Frame reordering is off,
-// so samples come out in presentation order and need no composition offsets.
+// must be BT.709 limited range with even dimensions. Unless c.Reorder is set
+// samples come out in presentation order and need no composition offsets.
 func NewH264Encoder(c EncodeConfig) (codec.VideoStreamEncoder, error) {
 	if err := Load(); err != nil {
 		return nil, err
@@ -273,17 +273,37 @@ func NewH264Encoder(c EncodeConfig) (codec.VideoStreamEncoder, error) {
 	if key <= 0 {
 		key = 2 * max(fps, 1)
 	}
+	if c.Quality < 0 || c.Quality > 1 {
+		e.Close()
+		return nil, fmt.Errorf("oscodec: encoder quality %v is outside 0..1", c.Quality)
+	}
+	reorder := k.cfFalse
+	if c.Reorder {
+		reorder = k.cfTrue
+	}
 	err := errors.Join(
 		set("profile", k.profileLevel, k.highAuto, false),
 		set("real-time mode", k.realTime, k.cfFalse, false),
-		set("frame reordering", k.reorder, k.cfFalse, false),
+		set("frame reordering", k.reorder, reorder, false),
 		set("keyframe interval", k.keyInterval, cfInt(key), true),
 		set("colour primaries", k.vtPrimaries, k.primaries709, false),
 		set("transfer function", k.vtTransfer, k.transfer709, false),
 		set("colour matrix", k.vtMatrix, k.matrix709, false),
 	)
+	if err == nil && c.Quality > 0 {
+		if qerr := set("quality", k.quality, cfFloat(c.Quality), true); qerr != nil {
+			err = fmt.Errorf("%w (%v)", ErrNoQualityMode, qerr)
+		}
+	}
 	if err == nil && c.Bitrate > 0 {
 		err = set("bit rate", k.bitRate, cfInt(int32(min(c.Bitrate, 1<<30))), true)
+	}
+	if err == nil && c.MaxBitrate > 0 {
+		// One limit: this many bytes in any one second (of decode time).
+		bytes, seconds := cfInt(int32(min(c.MaxBitrate, 1<<30)/8)), cfInt(1)
+		err = set("bit rate ceiling", k.rateLimits, cfArray(bytes, seconds), true)
+		cfRelease(bytes)
+		cfRelease(seconds)
 	}
 	if err != nil {
 		e.Close()

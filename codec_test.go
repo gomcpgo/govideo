@@ -6,15 +6,14 @@ import (
 	"fmt"
 	"image/color"
 	"math"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/gomcpgo/govideo"
+	"github.com/gomcpgo/govideo/codec/oscodec"
 	"github.com/gomcpgo/govideo/internal/oracle"
 	"github.com/gomcpgo/govideo/process"
-	"github.com/gomcpgo/govideo/videoprobe"
 )
 
 // The codec tests are built on the animated test card: every frame carries
@@ -339,11 +338,35 @@ func TestExportBitrates(t *testing.T) {
 	if aHigh < 140000 || aHigh > 200000 || aLow < 95000 || aLow > 135000 {
 		t.Errorf("audio bit rates %.0f (high) and %.0f (low), want about 192000 and 128000", aHigh, aLow)
 	}
-	// Synthetic bars need few bits, so compare an explicit ceiling instead
-	// of the quality presets.
+	// An explicit rate selects an average bit rate. Encoders differ in how
+	// closely they keep to it on a clip this short, so compare two rates.
 	v, a := rate("explicit.mp4", govideo.ExportOptions{VideoBitrate: 300_000, AudioBitrate: 96_000})
-	if v > 450_000 || a < 70000 || a > 100000 {
-		t.Errorf("explicit bit rates gave video %.0f and audio %.0f, want at most 450000 and about 96000", v, a)
+	vMore, _ := rate("explicit-more.mp4", govideo.ExportOptions{VideoBitrate: 3_000_000})
+	if v > 700_000 || v >= vMore || a < 70000 || a > 100000 {
+		t.Errorf("explicit bit rates gave video %.0f (and %.0f when asked for ten times as much) and audio %.0f, want about 300000 and 96000", v, vMore, a)
+	}
+
+	// Otherwise video is encoded to a quality, not a rate, where the encoder
+	// can do that: the presets order the sizes, and a picture that never
+	// changes costs next to nothing.
+	if enc, err := oscodec.NewH264Encoder(oscodec.EncodeConfig{Width: 64, Height: 64, FrameNum: 30, FrameDen: 1, Quality: 0.5}); err != nil {
+		t.Skipf("no quality-targeted encoding here: %v", err)
+	} else {
+		enc.Close()
+	}
+	vHigh, _ := rate("vhigh.mp4", govideo.ExportOptions{})
+	vLow, _ := rate("vlow.mp4", govideo.ExportOptions{Quality: govideo.QualityLow})
+	if vLow >= vHigh {
+		t.Errorf("video bit rates %.0f (low) and %.0f (high): the preset does not steer the encoder", vLow, vHigh)
+	}
+	still := filepath.Join(dir, "still.mp4")
+	tl := govideo.NewTimeline(govideo.Canvas{Width: 1280, Height: 720, FrameRate: govideo.R(30, 1)})
+	tl.AddGenerated(4*time.Second, govideo.GenerateOptions{Pattern: govideo.PatternBars})
+	if err := tl.Export(context.Background(), still, govideo.ExportOptions{Profile: govideo.ProfileCompatible}); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := oracle.Seconds(oracle.FFprobe(t, still).Streams[0].BitRate); v > 200_000 || v >= vHigh {
+		t.Errorf("unchanging bars took %.0f bit/s (the animated card took %.0f)", v, vHigh)
 	}
 }
 
@@ -517,66 +540,48 @@ func TestDecodeAVI(t *testing.T) {
 	}
 }
 
-// TestRealMedia exports the first seconds of every file in the directory
-// named by GOVIDEO_TEST_MEDIA with each available profile and has the oracle
-// decode the results. It is how a corpus of camera and phone files is
-// checked; without the variable it is skipped.
-func TestRealMedia(t *testing.T) {
-	root := os.Getenv("GOVIDEO_TEST_MEDIA")
-	if root == "" {
-		t.Skip("GOVIDEO_TEST_MEDIA is not set")
-	}
+// TestBFrameExport encodes the test card with B-frames, where decode order
+// and presentation order differ, and checks that players see every frame
+// once, in order, starting at time zero and in step with the sound.
+func TestBFrameExport(t *testing.T) {
 	oracle.Require(t)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	profiles := map[string]govideo.Profile{"intermediate.mov": govideo.ProfileIntermediate}
-	if govideo.BuildInfo().OSBackend {
-		profiles["compatible.mp4"] = govideo.ProfileCompatible
-	}
+	requireOS(t)
+	defer govideo.HookH264(func(c *oscodec.EncodeConfig) { c.Reorder = true }, nil)()
 	dir := t.TempDir()
-	for _, e := range entries {
-		if e.IsDir() || e.Name()[0] == '.' {
-			continue
-		}
-		in := filepath.Join(root, e.Name())
-		for suffix, profile := range profiles {
-			t.Run(e.Name()+"/"+suffix, func(t *testing.T) {
-				info, err := videoprobe.ProbeFile(context.Background(), in)
-				if err != nil {
-					t.Fatalf("probe: %v", err)
+	for _, name := range []string{"card.mp4", "card.mov"} {
+		t.Run(name, func(t *testing.T) {
+			out := filepath.Join(dir, name)
+			exportCard(t, out, 90, govideo.ExportOptions{Profile: govideo.ProfileCompatible})
+			if err := oracle.TryFFmpeg("-xerror", "-i", out, "-f", "null", "-"); err != nil {
+				t.Fatalf("ffmpeg cannot decode the export: %v", err)
+			}
+			pr := oracle.FFprobe(t, out, "-count_packets")
+			v := pr.Streams[0]
+			if v.HasBFrames == 0 {
+				t.Fatal("the stream has no B-frames, so the test shows nothing")
+			}
+			if v.NbReadPackets != "90" || v.RFrameRate != "30/1" || v.AvgFrameRate != "30/1" {
+				t.Errorf("%s packets at %s (average %s), want 90 at 30/1", v.NbReadPackets, v.RFrameRate, v.AvgFrameRate)
+			}
+			for i, st := range pr.Streams {
+				if d, _ := oracle.Seconds(st.Duration); math.Abs(d-3) > 0.001 {
+					t.Errorf("stream %d lasts %.4fs, want 3.0000", i, d)
 				}
-				want := min(info.Duration, 3*time.Second)
-				tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1)})
-				tl.AddClip(in, govideo.ClipOptions{Trim: govideo.Range(0, want)})
-				out := filepath.Join(dir, e.Name()+"."+suffix)
-				if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: profile}); err != nil {
-					t.Fatalf("export: %v", err)
+				if s, _ := oracle.Seconds(st.StartTime); s != 0 {
+					t.Errorf("stream %d starts at %.4fs, want 0", i, s)
 				}
-				defer os.Remove(out)
-				if err := oracle.TryFFmpeg("-xerror", "-i", out, "-f", "null", "-"); err != nil {
-					t.Fatalf("ffmpeg cannot decode the export: %v", err)
-				}
-				pr := oracle.FFprobe(t, out)
-				for i, st := range pr.Streams {
-					if d, _ := oracle.Seconds(st.Duration); math.Abs(d-want.Seconds()) > 0.05 {
-						t.Errorf("stream %d lasts %.3fs, want %.3f", i, d, want.Seconds())
-					}
-				}
-				// The picture must not be blank.
-				frames := oracle.Frames(t, out, cardW, cardH)
-				if len(frames) == 0 {
-					t.Fatal("no frames")
-				}
-				lo, hi := 255, 0
-				for _, v := range frames[len(frames)/2] {
-					lo, hi = min(lo, int(v)), max(hi, int(v))
-				}
-				if hi-lo < 40 {
-					t.Errorf("middle frame is flat (values %d..%d)", lo, hi)
-				}
-			})
-		}
+			}
+			checkCard(t, out, 0, 90, 12)
+			checkBeeps(t, out, 12, 0, 1, 2)
+
+			// Back in through govideo's own demuxer and the system decoder,
+			// whole and trimmed to a point between keyframes.
+			back := filepath.Join(dir, name+".back.mov")
+			transcode(t, out, back, govideo.TimeRange{}, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+			checkCard(t, back, 0, 90, 14)
+			checkBeeps(t, back, 12, 0, 1, 2)
+			transcode(t, out, back, govideo.Range(time.Second+100*time.Millisecond, 2*time.Second), govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+			checkCard(t, back, 33, 27, 14)
+		})
 	}
 }

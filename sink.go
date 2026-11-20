@@ -28,6 +28,15 @@ type audioSink interface {
 	close()
 }
 
+// Test hooks, nil outside tests. tuneH264 may change the encoder settings an
+// export has chosen; tapH264 sees every picture handed to the encoder. The
+// encoder-settings measurement uses them to compare rate-control modes
+// against the exact pictures that were encoded.
+var (
+	tuneH264 func(*oscodec.EncodeConfig)
+	tapH264  func(*codec.VideoFrame)
+)
+
 // mjpegSink writes Motion JPEG: every frame is a sync sample, and a repeated
 // picture reuses the encoded bytes.
 type mjpegSink struct {
@@ -51,7 +60,9 @@ func (s *mjpegSink) finish() error { return nil }
 func (s *mjpegSink) close()        {}
 
 // h264Sink writes H.264 from the operating-system encoder. The sample entry
-// is set once the encoder has produced its parameter sets.
+// is set once the encoder has produced its parameter sets. With B-frames the
+// encoder returns samples in decode order; each is written with the distance
+// between its presentation and decode positions as its composition offset.
 type h264Sink struct {
 	mux           *isobmff.Muxer
 	track         int
@@ -60,6 +71,7 @@ type h264Sink struct {
 	enc           codec.VideoStreamEncoder
 	last          *codec.VideoFrame
 	described     bool
+	written       int64 // samples written so far: the next decode position
 }
 
 func (s *h264Sink) write(pic *codec.VideoFrame) error {
@@ -71,6 +83,9 @@ func (s *h264Sink) write(pic *codec.VideoFrame) error {
 	}
 	pic = process.ConvertTo709Limited(pic)
 	s.last = pic
+	if tapH264 != nil {
+		tapH264(pic)
+	}
 	out, err := s.enc.Encode(pic)
 	if err != nil {
 		return err
@@ -90,9 +105,14 @@ func (s *h264Sink) emit(out []codec.EncodedFrame) error {
 				isobmff.Box("avcC", cfg), isobmff.ColrNCLX(1, 1, 1, false)))
 			s.described = true
 		}
-		if err := s.mux.WriteSample(s.track, f.Data, s.dur, f.Sync, 0); err != nil {
+		lead := f.Index - s.written
+		if lead < -64 || lead > 64 {
+			return fmt.Errorf("govideo: the H.264 encoder returned frame %d at decode position %d", f.Index, s.written)
+		}
+		if err := s.mux.WriteSample(s.track, f.Data, s.dur, f.Sync, int32(lead)*int32(s.dur)); err != nil {
 			return err
 		}
+		s.written++
 	}
 	return nil
 }
@@ -171,19 +191,52 @@ func (o *outputs) close() {
 	}
 }
 
-// videoBitrate picks an H.264 bit rate from the picture size, frame rate and
-// quality: about 8 Mbit/s for 1080p30 at high quality, the rate YouTube
-// recommends for SDR uploads.
-func (o *outputs) videoBitrate() int {
-	if o.opts.VideoBitrate > 0 {
-		return o.opts.VideoBitrate
+// h264Quality is the encoder quality setting for each Quality preset. The
+// values were chosen on a corpus of real footage to give the same median
+// picture quality as the average-bit-rate targets they replaced (SPEC §8.1).
+func (o *outputs) h264Quality() float64 {
+	switch o.opts.Quality {
+	case QualityLow:
+		return 0.55
+	case QualityMedium:
+		return 0.60
 	}
+	return 0.65
+}
+
+// fallbackBitrate picks an H.264 bit rate from the picture size, frame rate
+// and quality, for an encoder that has no quality-targeted mode: about
+// 8 Mbit/s for 1080p30 at high quality.
+func (o *outputs) fallbackBitrate() int {
 	bpp := map[Quality]float64{QualityLow: 0.045, QualityMedium: 0.08}[o.opts.Quality]
 	if bpp == 0 {
 		bpp = 0.13
 	}
 	rate := bpp * float64(o.canvas.Width) * float64(o.canvas.Height) * min(o.canvas.FrameRate.Float(), 60)
 	return int(max(rate, 150_000))
+}
+
+// h264Encoder opens the encoder. Unless the caller fixed a bit rate, it asks
+// for a constant picture quality, so that the size follows the content: a
+// slide show comes out small and a busy scene keeps its detail.
+func (o *outputs) h264Encoder() (codec.VideoStreamEncoder, error) {
+	cv := o.canvas
+	ec := oscodec.EncodeConfig{Width: cv.Width, Height: cv.Height, FrameNum: cv.FrameRate.Num, FrameDen: cv.FrameRate.Den}
+	if o.opts.VideoBitrate > 0 {
+		ec.Bitrate = o.opts.VideoBitrate
+	} else {
+		ec.Quality = o.h264Quality()
+	}
+	if tuneH264 != nil {
+		tuneH264(&ec)
+	}
+	enc, err := oscodec.NewH264Encoder(ec)
+	if errors.Is(err, oscodec.ErrNoQualityMode) {
+		// Not every encoder has a quality mode; aim for a bit rate instead.
+		ec.Quality, ec.Bitrate = 0, o.fallbackBitrate()
+		enc, err = oscodec.NewH264Encoder(ec)
+	}
+	return enc, err
 }
 
 func (o *outputs) audioBitrate() int {
@@ -211,8 +264,7 @@ func (o *outputs) video(timescale, dur uint32) (videoSink, error) {
 			enc: &native.MJPEGEncoder{Quality: map[Quality]int{QualityLow: 70, QualityMedium: 82}[o.opts.Quality]}}
 		return s, nil
 	}
-	enc, err := oscodec.NewH264Encoder(oscodec.EncodeConfig{Width: cv.Width, Height: cv.Height,
-		FrameNum: cv.FrameRate.Num, FrameDen: cv.FrameRate.Den, Bitrate: o.videoBitrate()})
+	enc, err := o.h264Encoder()
 	if err != nil {
 		return nil, fmt.Errorf("govideo: %w", err)
 	}

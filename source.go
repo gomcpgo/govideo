@@ -67,6 +67,16 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		return fail(err)
 	}
 	if m.info, err = videoprobe.Probe(ctx, f, st.Size()); err != nil {
+		// A bare audio file of a codec with no decoder is a missing codec,
+		// and is reported as one.
+		var uf *videoprobe.UnsupportedFormatError
+		if errors.As(err, &uf) {
+			if id, ok := map[string]CodecID{"mp3": "mp3", "flac": "flac", "ac3": "ac3"}[uf.Format]; ok {
+				if _, cerr := Available(id, Decode); cerr != nil {
+					return fail(cerr)
+				}
+			}
+		}
 		return fail(err)
 	}
 	switch m.info.Format {
@@ -134,6 +144,11 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 				}
 				r.mediaStart = e.MediaTime
 				break
+			}
+			// Audio files from iTunes-style encoders mark the encoder's
+			// priming samples in a tag instead of an edit list.
+			if g := m.iso.Gapless; g != nil && len(t.Edits) == 0 && s.Audio != nil && s.Audio.SampleRate > 0 {
+				r.mediaStart = int64(g.Priming) * int64(t.Timescale) / int64(s.Audio.SampleRate)
 			}
 			return r, nil
 		}
@@ -224,6 +239,11 @@ func (r *isoReader) next() (packet, error) {
 		return packet{}, err
 	}
 	data, err := r.f.ReadSample(s, n, nil)
+	if errors.Is(err, isobmff.ErrTruncated) {
+		// The file was cut short: play what is there. The picture then
+		// holds on the last complete frame and the audio falls silent.
+		return packet{}, io.EOF
+	}
 	if err != nil {
 		return packet{}, err
 	}
@@ -334,6 +354,9 @@ type audioStream struct {
 	skip    int64 // output frames still to drop (trim, negative start)
 	started bool
 	eof     bool
+	decoded int    // packets decoded so far
+	codec   string // codec and profile, for error messages
+	profile string
 }
 
 func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
@@ -365,7 +388,7 @@ func openAudio(ctx context.Context, m *media, s *videoprobe.Stream, trim time.Du
 		closeDecoder(dec)
 		return nil, err
 	}
-	return &audioStream{rd: rd, dec: dec, skip: durToFrames(trim)}, nil
+	return &audioStream{rd: rd, dec: dec, skip: durToFrames(trim), codec: s.Codec, profile: s.Profile}, nil
 }
 
 // closeDecoder releases a decoder that holds operating-system resources.
@@ -397,9 +420,20 @@ func (a *audioStream) read(dst []float32) (int, error) {
 			return 0, err
 		default:
 			fr, err := a.dec.Decode(p.data)
+			if err != nil && a.decoded < 4 {
+				// The decoder opened but fails from the outset: a profile
+				// or layout the system codec does not handle.
+				cu := &ErrCodecUnavailable{Codec: canonical(CodecID(a.codec)), Op: Decode,
+					Reason: "the decoder rejected the stream: " + err.Error()}
+				if a.profile != "" {
+					cu.Reason = "the decoder does not handle this " + a.profile + " stream: " + err.Error()
+				}
+				return 0, cu
+			}
 			if err != nil {
 				return 0, err
 			}
+			a.decoded++
 			if !a.started {
 				a.started = true
 				// A positive first timestamp is leading silence; a negative
@@ -461,6 +495,7 @@ type videoStream struct {
 	intra    codec.VideoDecoder       // intra-only codecs
 	dec      codec.VideoStreamDecoder // inter-frame codecs
 	rotation int
+	mirror   bool          // flip left to right after rotating
 	start    time.Duration // first time that will be asked for
 	slack    time.Duration // how far past the asked time a frame may start
 
@@ -487,7 +522,7 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	if err != nil {
 		return nil, err
 	}
-	v := &videoStream{rd: rd, rotation: s.Video.Rotation, start: start, slack: slack, shownSeq: -1}
+	v := &videoStream{rd: rd, rotation: s.Video.Rotation, mirror: s.Video.Mirrored, start: start, slack: slack, shownSeq: -1}
 	if ci.ID == "mjpeg" {
 		v.intra = native.MJPEGDecoder{}
 		return v, nil
@@ -641,7 +676,11 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 				return nil, 0, err
 			}
 		}
-		v.shown, v.shownSeq = process.Rotate(f, v.rotation), v.seq
+		f = process.Rotate(f, v.rotation)
+		if v.mirror {
+			f = process.FlipH(f) // the frame is this stream's own
+		}
+		v.shown, v.shownSeq = f, v.seq
 	}
 	return v.shown, v.seq, nil
 }
@@ -652,9 +691,18 @@ func decodeStill(path string) (*codec.VideoFrame, error) {
 	if err != nil {
 		return nil, err
 	}
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
+		var uf *videoprobe.UnsupportedFormatError
+		if _, perr := videoprobe.Probe(context.Background(), bytes.NewReader(data), int64(len(data))); errors.As(perr, &uf) && uf.Format == "heif" {
+			return nil, fmt.Errorf("govideo: %s: %w", path, &ErrCodecUnavailable{Codec: "heic", Op: Decode,
+				Reason: "HEIC and AVIF stills need the operating system's image decoder, which is not connected yet"})
+		}
 		return nil, fmt.Errorf("govideo: %s: %w", path, err)
+	}
+	if yuv, ok := img.(*image.YCbCr); ok && format == "webp" {
+		// Lossy WebP is limited-range video Y'CbCr, not JPEG's full range.
+		return process.FromVideoYCbCr(yuv), nil
 	}
 	orient := process.EXIFOrientation(bytes.NewReader(data))
 	return process.FromImage(process.Orient(img, orient)), nil

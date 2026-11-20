@@ -38,7 +38,10 @@ func (p Profile) String() string {
 	return [...]string{"auto", "compatible", "royalty-free", "intermediate"}[p]
 }
 
-// Quality is a coarse quality setting.
+// Quality is a coarse quality setting. For H.264 it selects a picture quality
+// that the encoder holds whatever the content, so the file size follows the
+// material: little for a still or a slide, much more for grain or fast
+// motion. Set ExportOptions.VideoBitrate when the size must be predictable.
 type Quality int
 
 const (
@@ -58,8 +61,10 @@ type Progress struct {
 type ExportOptions struct {
 	Profile Profile
 	Quality Quality
-	// VideoBitrate and AudioBitrate, in bits per second, override the rates
-	// that Quality selects. They apply to ProfileCompatible.
+	// VideoBitrate and AudioBitrate, in bits per second, apply to
+	// ProfileCompatible. VideoBitrate replaces the quality-targeted encoding
+	// that Quality selects with an average bit rate; AudioBitrate overrides
+	// the rate Quality selects.
 	VideoBitrate int
 	AudioBitrate int
 	Progress     func(Progress)
