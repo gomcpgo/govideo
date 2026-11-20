@@ -231,7 +231,7 @@ func (o *outputs) h264Encoder() (codec.VideoStreamEncoder, error) {
 		tuneH264(&ec)
 	}
 	enc, err := oscodec.NewH264Encoder(ec)
-	if err != nil && ec.Quality > 0 && !errors.Is(err, oscodec.ErrUnsupported) {
+	if errors.Is(err, oscodec.ErrNoQualityMode) {
 		// Not every encoder has a quality mode; aim for a bit rate instead.
 		ec.Quality, ec.Bitrate = 0, o.fallbackBitrate()
 		enc, err = oscodec.NewH264Encoder(ec)

@@ -3,6 +3,7 @@
 package oscodec
 
 import (
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -236,7 +237,7 @@ func TestH264Reorder(t *testing.T) {
 		t.Skipf("frameworks unavailable: %v", err)
 	}
 	const w, h, count = 320, 240, 60
-	enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Quality: 0.6, Reorder: true})
+	enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Bitrate: 1_000_000, Reorder: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,6 +311,9 @@ func TestH264Quality(t *testing.T) {
 	const w, h = 320, 240
 	size := func(q float64) (n int) {
 		enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Quality: q})
+		if errors.Is(err, ErrNoQualityMode) {
+			t.Skip(err)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}

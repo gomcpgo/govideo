@@ -12,6 +12,11 @@ import "errors"
 // backend, or that the backend lacks the requested codec.
 var ErrUnsupported = errors.New("oscodec: no operating-system codec for this format on this platform")
 
+// ErrNoQualityMode reports that the H.264 encoder of this machine has no
+// quality-targeted rate control (the software encoder used where there is
+// no hardware one, for example). Ask for a bit rate instead.
+var ErrNoQualityMode = errors.New("oscodec: the H.264 encoder has no quality-targeted mode")
+
 // VideoConfig describes a compressed video stream to decode.
 type VideoConfig struct {
 	Codec         string // "h264" or "hevc"

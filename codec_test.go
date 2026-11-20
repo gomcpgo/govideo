@@ -338,8 +338,22 @@ func TestExportBitrates(t *testing.T) {
 	if aHigh < 140000 || aHigh > 200000 || aLow < 95000 || aLow > 135000 {
 		t.Errorf("audio bit rates %.0f (high) and %.0f (low), want about 192000 and 128000", aHigh, aLow)
 	}
-	// Video is encoded to a quality, not a rate: the presets order the sizes,
-	// and a picture that never changes costs next to nothing.
+	// An explicit rate selects an average bit rate. Encoders differ in how
+	// closely they keep to it on a clip this short, so compare two rates.
+	v, a := rate("explicit.mp4", govideo.ExportOptions{VideoBitrate: 300_000, AudioBitrate: 96_000})
+	vMore, _ := rate("explicit-more.mp4", govideo.ExportOptions{VideoBitrate: 3_000_000})
+	if v > 700_000 || v >= vMore || a < 70000 || a > 100000 {
+		t.Errorf("explicit bit rates gave video %.0f (and %.0f when asked for ten times as much) and audio %.0f, want about 300000 and 96000", v, vMore, a)
+	}
+
+	// Otherwise video is encoded to a quality, not a rate, where the encoder
+	// can do that: the presets order the sizes, and a picture that never
+	// changes costs next to nothing.
+	if enc, err := oscodec.NewH264Encoder(oscodec.EncodeConfig{Width: 64, Height: 64, FrameNum: 30, FrameDen: 1, Quality: 0.5}); err != nil {
+		t.Skipf("no quality-targeted encoding here: %v", err)
+	} else {
+		enc.Close()
+	}
 	vHigh, _ := rate("vhigh.mp4", govideo.ExportOptions{})
 	vLow, _ := rate("vlow.mp4", govideo.ExportOptions{Quality: govideo.QualityLow})
 	if vLow >= vHigh {
@@ -353,11 +367,6 @@ func TestExportBitrates(t *testing.T) {
 	}
 	if v, _ := oracle.Seconds(oracle.FFprobe(t, still).Streams[0].BitRate); v > 200_000 || v >= vHigh {
 		t.Errorf("unchanging bars took %.0f bit/s (the animated card took %.0f)", v, vHigh)
-	}
-	// An explicit rate switches to an average bit rate.
-	v, a := rate("explicit.mp4", govideo.ExportOptions{VideoBitrate: 300_000, AudioBitrate: 96_000})
-	if v > 450_000 || a < 70000 || a > 100000 {
-		t.Errorf("explicit bit rates gave video %.0f and audio %.0f, want at most 450000 and about 96000", v, a)
 	}
 }
 

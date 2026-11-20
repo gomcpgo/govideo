@@ -291,7 +291,9 @@ func NewH264Encoder(c EncodeConfig) (codec.VideoStreamEncoder, error) {
 		set("colour matrix", k.vtMatrix, k.matrix709, false),
 	)
 	if err == nil && c.Quality > 0 {
-		err = set("quality", k.quality, cfFloat(c.Quality), true)
+		if qerr := set("quality", k.quality, cfFloat(c.Quality), true); qerr != nil {
+			err = fmt.Errorf("%w (%v)", ErrNoQualityMode, qerr)
+		}
 	}
 	if err == nil && c.Bitrate > 0 {
 		err = set("bit rate", k.bitRate, cfInt(int32(min(c.Bitrate, 1<<30))), true)

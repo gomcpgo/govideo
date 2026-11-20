@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -27,6 +28,21 @@ func needOracle(t *testing.T) {
 	}
 }
 
+var encoders = sync.OnceValue(func() string {
+	b, _ := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output()
+	return string(b)
+})
+
+// hasEncoder reports whether the installed ffmpeg lists the named encoder.
+func hasEncoder(name string) bool {
+	for _, line := range strings.Split(encoders(), "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[1] == name {
+			return true
+		}
+	}
+	return false
+}
+
 // generate runs ffmpeg and returns the output path. With optional set, an
 // encoder failure skips the test (hardware/OS encoders are not always
 // usable). An ffmpeg built without the encoder skips it in any case: the
@@ -36,8 +52,13 @@ func generate(t *testing.T, optional bool, out string, args ...string) string {
 	path := filepath.Join(t.TempDir(), out)
 	full := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)
 	full = append(full, path)
+	for i, arg := range args[:len(args)-1] {
+		if enc := args[i+1]; (arg == "-c:v" || arg == "-c:a") && !hasEncoder(enc) {
+			t.Skipf("this ffmpeg has no %s encoder", enc)
+		}
+	}
 	if b, err := exec.Command("ffmpeg", full...).CombinedOutput(); err != nil {
-		if optional || bytes.Contains(b, []byte("Unknown encoder")) {
+		if optional {
 			t.Skipf("ffmpeg could not produce fixture: %v\n%s", err, b)
 		}
 		t.Fatalf("ffmpeg %s: %v\n%s", strings.Join(full, " "), err, b)
