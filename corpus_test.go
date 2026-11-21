@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,7 +25,7 @@ import (
 // clips that must export) or has these sub-directories:
 //
 //	video/        clips that must export with every profile and match the
-//	              oracle's picture
+//	              oracle's picture, from the start and from a cut inside
 //	audio/        files laid over a generated clip with AddAudio; each must
 //	              either work or fail with ErrCodecUnavailable
 //	stills/       images for AddImage (searched recursively)
@@ -137,6 +138,57 @@ func corpusVideo(t *testing.T, dir string) {
 				}
 			})
 		}
+		// A trim that starts inside the file makes the decoder start at the
+		// keyframe before the cut (MP4 sync samples, the Matroska keyframe
+		// index). The pictures must still be the ones the oracle reaches by
+		// decoding from the start.
+		t.Run(name+"/trim", func(t *testing.T) {
+			info, err := videoprobe.ProbeFile(context.Background(), in)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			var span time.Duration
+			for _, st := range info.Streams {
+				if st.Kind == videoprobe.Video {
+					span = st.Duration
+					break
+				}
+			}
+			// Whole tenths of a second are whole frames at 30 fps.
+			cut := min(span*2/3, 8*time.Second).Truncate(100 * time.Millisecond)
+			if cut < time.Second {
+				t.Skipf("the video lasts %v: too short to cut into", span)
+			}
+			tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1)})
+			tl.AddClip(in, govideo.ClipOptions{Trim: govideo.Range(cut, cut+time.Second)})
+			out := filepath.Join(tmp, name+".trim.mov")
+			if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			defer os.Remove(out)
+			ours := thumbs(t, "", "-i", out)
+			ref := thumbs(t, fit, "-t", strconv.FormatFloat((cut+1500*time.Millisecond).Seconds(), 'f', 3, 64), "-i", in)
+			off := int(cut * 30 / time.Second)
+			if len(ours) == 0 || len(ref) == 0 {
+				t.Fatalf("no frames to compare (%d exported, %d from the oracle)", len(ours), len(ref))
+			}
+			last := min(len(ours), len(ref)-off) - 1
+			if len(ref) <= off {
+				// The file was cut short before the trim: the picture holds
+				// on the last frame that is there.
+				t.Logf("the oracle decodes %d frames and the cut is at frame %d: expecting the last frame, held", len(ref), off)
+				last = len(ours) - 1
+			}
+			for _, n := range []int{0, last / 2, last} {
+				best := 0.0
+				for k := max(min(off+n, len(ref)-1)-3, 0); k <= min(off+n+3, len(ref)-1); k++ {
+					best = max(best, psnr(ours[n], ref[k]))
+				}
+				if best < 26 {
+					t.Errorf("frame %d after the cut at %v differs from the oracle's decode (PSNR %.1f dB)", n, cut, best)
+				}
+			}
+		})
 	}
 }
 

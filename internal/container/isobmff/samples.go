@@ -403,6 +403,12 @@ func (it *SampleIter) NextBlock(max int) (s Sample, count int, err error) {
 	return s, int(n), nil
 }
 
+// Present reports whether the bytes of s lie within the file. The index of a
+// file that was cut short lists samples that were never written.
+func (f *File) Present(s Sample) bool {
+	return s.Offset >= 0 && s.Offset+int64(s.Size) <= f.size
+}
+
 // ReadSample reads the bytes of a sample (or of count consecutive samples
 // returned by NextBlock) after validating the range against the file size.
 func (f *File) ReadSample(s Sample, count int, buf []byte) ([]byte, error) {

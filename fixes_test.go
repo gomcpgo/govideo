@@ -88,6 +88,104 @@ func TestTruncatedFile(t *testing.T) {
 	}
 }
 
+// TestTruncatedFileTrim covers a trim that starts past the point where a
+// file was cut short. The index still lists sync samples there, but a seek
+// must not start at one that was never written: the picture holds on the
+// last complete frame, as it does without the trim.
+func TestTruncatedFileTrim(t *testing.T) {
+	oracle.Require(t)
+	requireOS(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "card.mov")
+	exportCard(t, src, 60, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	whole := filepath.Join(dir, "whole.mp4")
+	if err := oracle.TryFFmpeg("-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
+		"-g", "10", "-bf", "0", "-an", "-movflags", "+faststart", whole); err != nil {
+		t.Skipf("the oracle cannot make this fixture: %v", err)
+	}
+	data, err := os.ReadFile(whole)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cut := filepath.Join(dir, "cut.mp4")
+	if err := os.WriteFile(cut, data[:len(data)/2], 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(dir, "out.mov")
+	transcode(t, cut, out, govideo.Range(1500*time.Millisecond, 2*time.Second), govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	frames := oracle.Frames(t, out, cardW, cardH)
+	if len(frames) != 15 {
+		t.Fatalf("%d frames, want 15", len(frames))
+	}
+	held := counter(frames[0])
+	for i, f := range frames {
+		if n := counter(f); n != held {
+			t.Fatalf("output frame %d shows source frame %d; want it to hold frame %d", i, n, held)
+		}
+	}
+	if held < 15 || held > 44 {
+		t.Errorf("playback holds frame %d; about half of 60 frames survive the cut, and the trim starts at frame 45", held)
+	}
+}
+
+// TestSeekOpenGOP covers a trim into a stream whose sync samples are not
+// IDR pictures. The pictures that follow such a sample in the file but come
+// before it on screen refer to the group of pictures the seek skipped, and
+// the system decoder, once fed them, failed on every later frame.
+func TestSeekOpenGOP(t *testing.T) {
+	oracle.Require(t)
+	requireOS(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "card.mov")
+	exportCard(t, src, 90, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	for _, name := range []string{"opengop.mp4", "opengop.mkv"} {
+		t.Run(name, func(t *testing.T) {
+			in := filepath.Join(dir, name)
+			// Interlaced coding with reference B-frames, as broadcast
+			// encoders write it.
+			if err := oracle.TryFFmpeg("-i", src,
+				"-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=tv:out_color_matrix=bt709",
+				"-c:v", "libx264", "-profile:v", "main", "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p",
+				"-flags", "+ildct+ilme", "-bf", "3", "-refs", "4", "-g", "20", "-x264-params", "open-gop=1:b-pyramid=strict:b-adapt=0",
+				"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-an", in); err != nil {
+				t.Skipf("the oracle cannot make this fixture: %v", err)
+			}
+			out := filepath.Join(dir, name+".out.mov")
+			transcode(t, in, out, govideo.Range(1700*time.Millisecond, 2500*time.Millisecond),
+				govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+			checkCard(t, out, 51, 24, 14)
+		})
+	}
+}
+
+// TestEditListPreroll covers a file whose edit list starts between sync
+// samples, as a stream copy cut with -ss writes it. The packets before time
+// zero are not shown, but the first pictures refer to them: they have to be
+// decoded, with or without a trim.
+func TestEditListPreroll(t *testing.T) {
+	oracle.Require(t)
+	requireOS(t)
+	dir := t.TempDir()
+	src := filepath.Join(dir, "card.mov")
+	exportCard(t, src, 90, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	whole := filepath.Join(dir, "whole.mp4")
+	if err := oracle.TryFFmpeg("-i", src,
+		"-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=tv:out_color_matrix=bt709",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-bf", "2", "-g", "20",
+		"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-an", whole); err != nil {
+		t.Skipf("the oracle cannot make this fixture: %v", err)
+	}
+	// Keyframes at frames 20 and 40; the copy starts at frame 30.
+	in := filepath.Join(dir, "cut.mp4")
+	oracle.FFmpeg(t, "-ss", "1", "-i", whole, "-c", "copy", in)
+	out := filepath.Join(dir, "out.mov")
+	transcode(t, in, out, govideo.TimeRange{}, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	checkCard(t, out, 30, 60, 14)
+	trimmed := filepath.Join(dir, "trimmed.mov")
+	transcode(t, in, trimmed, govideo.Range(500*time.Millisecond, time.Second), govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	checkCard(t, trimmed, 45, 15, 14)
+}
+
 // TestMultichannelAACOrder checks that 5.1 AAC, which codes the centre
 // channel first, is downmixed with left on the left, and at the ITU-R
 // BS.775 levels without normalisation (govideo#2): fronts at unity, centre

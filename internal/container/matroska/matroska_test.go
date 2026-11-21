@@ -432,6 +432,90 @@ func TestOpenSkipsPayloads(t *testing.T) {
 	}
 }
 
+// TestNewReaderAt checks the keyframe index built by Open's scan: a seek
+// starts the track at its last keyframe at or before the time asked for.
+func TestNewReaderAt(t *testing.T) {
+	data := bytes.Join([][]byte{
+		header("webm"),
+		el(idSegment,
+			el(idTracks, videoTrack(1), audioTrack(2)),
+			el(idCluster, el(idTimestamp, u(0)),
+				simpleBlock(1, 0, 0x80, []byte("f0")),
+				simpleBlock(2, 0, 0x80, []byte("a0")),
+				simpleBlock(1, 50, 0, []byte("f1"))),
+			// The Cluster opens with the end of the previous group of
+			// pictures and holds two keyframes, as Clusters cut by time do.
+			el(idCluster, el(idTimestamp, u(100)),
+				simpleBlock(1, 0, 0, []byte("f2")),
+				simpleBlock(2, 10, 0x80, []byte("a1")),
+				simpleBlock(1, 33, 0x80, []byte("f3")),
+				simpleBlock(1, 50, 0, []byte("f4")),
+				simpleBlock(2, 60, 0x80, []byte("a2")),
+				simpleBlock(1, 66, 0x80, []byte("f5")),
+				simpleBlock(1, 80, 0, []byte("f6"))),
+			el(idCluster, el(idTimestamp, u(200)), // no keyframe
+				simpleBlock(1, 0, 0, []byte("f7"))),
+			el(idCluster, el(idTimestamp, u(300)),
+				el(idBlockGroup, el(idBlock, []byte{0x81, 0, 0, 0}, []byte("f8")))),
+		),
+	}, nil)
+	f := open(t, data)
+	ms := time.Millisecond
+	for _, c := range []struct {
+		track uint64
+		at    time.Duration
+		ok    bool
+		video string // first packet of the video track
+		audio string // first packet of the audio track
+	}{
+		{1, 0, true, "f0", "a0"},
+		{1, 132 * ms, true, "f0", "a0"}, // the keyframes of the second Cluster are later
+		{1, 133 * ms, true, "f3", "a1"}, // other tracks start with the Cluster
+		{1, 165 * ms, true, "f3", "a1"},
+		{1, 166 * ms, true, "f5", "a1"}, // the second keyframe of a Cluster
+		{1, 299 * ms, true, "f5", "a1"},
+		{1, 300 * ms, true, "f8", ""},
+		{1, time.Hour, true, "f8", ""},
+		{2, time.Hour, false, "f0", "a0"}, // audio is not indexed
+		{9, time.Hour, false, "f0", "a0"}, // no such track
+	} {
+		pr, ok := f.NewReaderAt(context.Background(), c.track, c.at)
+		var video, audio *Packet
+		for {
+			p, err := pr.Next()
+			if err != nil {
+				break
+			}
+			if p.Track == 1 && video == nil {
+				video = p
+			}
+			if p.Track == 2 && audio == nil {
+				audio = p
+			}
+		}
+		name := func(p *Packet) string {
+			if p == nil {
+				return ""
+			}
+			return string(p.Data)
+		}
+		if ok != c.ok || name(video) != c.video || name(audio) != c.audio {
+			t.Errorf("track %d at %v: ok=%v video %q audio %q, want %v %q %q",
+				c.track, c.at, ok, name(video), name(audio), c.ok, c.video, c.audio)
+		}
+		if ok && (video == nil || !video.Keyframe || video.Timestamp > c.at) {
+			t.Errorf("track %d at %v: reading starts at %+v, want a keyframe at or before the time", c.track, c.at, video)
+		}
+	}
+
+	// Unknown-size Clusters, as browsers write them.
+	f = open(t, liveFile())
+	pr, ok := f.NewReaderAt(context.Background(), 1, 120*ms)
+	if p, err := pr.Next(); !ok || err != nil || string(p.Data) != "f3" || p.Timestamp != 100*ms {
+		t.Errorf("live file: ok=%v %+v %v", ok, p, err)
+	}
+}
+
 func FuzzOpen(f *testing.F) {
 	f.Add(liveFile())
 	f.Add(bytes.Join([][]byte{header("matroska"), el(idSegment,
@@ -452,6 +536,14 @@ func FuzzOpen(f *testing.F) {
 		for i := 0; i < 100000; i++ {
 			if _, err := pr.Next(); err == io.EOF {
 				break
+			}
+		}
+		for _, tr := range mf.Tracks[:min(len(mf.Tracks), 4)] {
+			pr, _ := mf.NewReaderAt(context.Background(), tr.Number, mf.Duration/2)
+			for i := 0; i < 1000; i++ {
+				if _, err := pr.Next(); err == io.EOF {
+					break
+				}
 			}
 		}
 	})
