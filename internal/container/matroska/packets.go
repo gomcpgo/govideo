@@ -49,6 +49,39 @@ func (f *File) NewReaderContext(ctx context.Context) *PacketReader {
 	}}
 }
 
+// NewReaderAt returns a reader that starts at the Cluster holding the last
+// keyframe of a video track presented at or before t, so that a decoder need
+// not start from the beginning of the file. The keyframes come from Open's
+// scan of every Cluster rather than from Cues, which files written live lack
+// and which may list only some keyframes.
+//
+// Packets of the track that precede the keyframe in its Cluster belong to the
+// previous group of pictures: decoding starts at the first packet of the track
+// with Keyframe set. ok is false when the scan found no keyframe at or before
+// t; the reader then starts at the first Cluster, as NewReaderContext's does.
+func (f *File) NewReaderAt(ctx context.Context, track uint64, t time.Duration) (pr *PacketReader, ok bool) {
+	pr = f.NewReaderContext(ctx)
+	tr := f.byNum[track]
+	if tr == nil {
+		return pr, false
+	}
+	pos := int64(-1)
+	for _, sp := range tr.seek {
+		// Keyframes come in presentation order in any sane file; stopping
+		// at the first one past t keeps an out-of-order index safe, since
+		// starting early only costs time.
+		if f.ticks(sp.ts) > t {
+			break
+		}
+		pos = sp.pos
+	}
+	if pos < 0 {
+		return pr, false
+	}
+	pr.w.pos = pos
+	return pr, true
+}
+
 // Next returns the next packet, or io.EOF at the end of the file (including a
 // truncated end). Laced blocks are split into one packet per frame. Packets
 // of tracks with a non-nil Track.Err are skipped. A frame that fails to

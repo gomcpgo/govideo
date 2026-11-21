@@ -158,7 +158,7 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 				if t.Err != nil {
 					return nil, t.Err
 				}
-				return &mkvReader{pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
+				return &mkvReader{f: m.mkv, ctx: ctx, pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
 			}
 		}
 	case m.wv != nil:
@@ -255,9 +255,14 @@ func (r *isoReader) time(t int64) time.Duration {
 	return r.shift + time.Duration(float64(t-r.mediaStart)/float64(r.ts)*1e9)
 }
 
-// seekSync positions the reader on the last sync sample presented at or
-// before t, so a decoder need not start from the beginning of the file. It
-// must be called before the first next.
+// syncSeeker is a packetReader that can start at a sync sample.
+type syncSeeker interface {
+	// seekSync positions the reader on the last sync sample presented at
+	// or before t, so a decoder need not start from the beginning of the
+	// file. It must be called before the first next.
+	seekSync(t time.Duration)
+}
+
 func (r *isoReader) seekSync(t time.Duration) {
 	it := r.tr.Iter()
 	skip := 0
@@ -278,12 +283,18 @@ func (r *isoReader) seekSync(t time.Duration) {
 }
 
 type mkvReader struct {
+	f     *matroska.File
+	ctx   context.Context
 	pr    *matroska.PacketReader
 	track uint64
 	// delay is the track's CodecDelay: block timestamps are that much later
 	// than presentation time, so the encoder's priming samples land before
 	// time zero and are cut like any other leading audio.
 	delay time.Duration
+	// needKey drops the track's packets up to its first keyframe: after a
+	// seek, those that open the Cluster belong to the previous group of
+	// pictures.
+	needKey bool
 }
 
 func (r *mkvReader) next() (packet, error) {
@@ -292,9 +303,17 @@ func (r *mkvReader) next() (packet, error) {
 		if err != nil {
 			return packet{}, err
 		}
-		if p.Track == r.track {
-			return packet{pts: p.Timestamp - r.delay, data: p.Data}, nil
+		if p.Track != r.track || r.needKey && !p.Keyframe {
+			continue
 		}
+		r.needKey = false
+		return packet{pts: p.Timestamp - r.delay, data: p.Data, sync: p.Keyframe}, nil
+	}
+}
+
+func (r *mkvReader) seekSync(t time.Duration) {
+	if pr, ok := r.f.NewReaderAt(r.ctx, r.track, t+r.delay); ok {
+		r.pr, r.needKey = pr, true
 	}
 }
 
@@ -539,8 +558,8 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
-	if ir, ok := rd.(*isoReader); ok && start > 0 {
-		ir.seekSync(start)
+	if sk, ok := rd.(syncSeeker); ok && start > 0 {
+		sk.seekSync(start)
 	}
 	return v, nil
 }
