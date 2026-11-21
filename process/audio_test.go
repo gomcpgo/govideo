@@ -202,8 +202,22 @@ func TestToStereo(t *testing.T) {
 	if r := float64(c[0] / l[0]); math.Abs(r-math.Sqrt2/2) > 1e-5 {
 		t.Errorf("centre is %g of front, want -3 dB", r)
 	}
-	// Full-scale on every channel must not exceed full scale, and no
-	// channel count may panic.
+	// The matrix is not normalised: the front channels pass at unity, as in
+	// ITU-R BS.775, whatever the channel count.
+	for _, ch := range []int{3, 4, 5, 6, 8} {
+		in := make([]float32, ch)
+		in[0] = 0.5
+		if out := ToStereo(in, ch); out[0] != 0.5 || out[1] != 0 {
+			t.Errorf("%d channels: front left 0.5 came out as %v, want unity gain", ch, out)
+		}
+	}
+	// 5.1 at full scale on every channel sums to 1 + 2/sqrt(2) a side; the
+	// mixer's soft clipper, not the downmix, deals with it.
+	full := ToStereo([]float32{1, 1, 1, 1, 1, 1}, 6)
+	if want := 1 + math.Sqrt2; math.Abs(float64(full[0])-want) > 1e-5 || full[0] != full[1] {
+		t.Errorf("full-scale 5.1: %v, want %g a side", full, want)
+	}
+	// No channel count may panic, and none may come out silent.
 	for ch := 1; ch <= 12; ch++ {
 		in := make([]float32, ch*3+1) // with a trailing partial frame
 		for i := range in {
@@ -214,7 +228,7 @@ func TestToStereo(t *testing.T) {
 			t.Fatalf("%d channels: %d output samples", ch, len(out))
 		}
 		for _, v := range out {
-			if v > 1.00001 || v <= 0 {
+			if v <= 0 {
 				t.Fatalf("%d channels: sample %g", ch, v)
 			}
 		}

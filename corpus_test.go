@@ -169,8 +169,16 @@ func corpusAudio(t *testing.T, dir string) {
 				t.Fatal("the export is silent")
 			}
 			info, perr := videoprobe.ProbeFile(context.Background(), in)
-			if perr != nil || len(info.Streams) == 0 || info.Streams[0].Audio == nil || info.Streams[0].Audio.Channels > 2 {
-				return // multichannel downmixes differ in gain; decoding is enough
+			if perr != nil || len(info.Streams) == 0 || info.Streams[0].Audio == nil {
+				return
+			}
+			// oracle.Audio folds both sides to mono, so the reference has to
+			// reach stereo the way the export does for the levels to compare.
+			switch ch := info.Streams[0].Audio.Channels; {
+			case ch == 1: // duplicated at unity
+				ref = oracle.Audio(t, in, "0:a:0", "-af", "pan=stereo|c0=c0|c1=c0")
+			case ch > 2: // the oracle's stereo downmix; its 5.1-to-mono weights differ
+				ref = oracle.Audio(t, in, "0:a:0", "-af", "aformat=sample_fmts=flt:channel_layouts=stereo")
 			}
 			// PCM must agree with the oracle sample for sample. AAC decoders
 			// differ in how much SBR delay they remove (up to about 30 ms),
@@ -194,6 +202,18 @@ func corpusAudio(t *testing.T, dir string) {
 			}
 			if best < 0.97 {
 				t.Errorf("audio correlates %.3f with the oracle's decode, want at least 0.97 (wrong timing or content)", best)
+			}
+			// The level must match too: multichannel sources are downmixed
+			// without normalisation, as the oracle does (govideo#2).
+			var eo, er float64
+			for i := span; i < span+n; i++ {
+				eo += float64(ours[i]) * float64(ours[i])
+				er += float64(ref[i]) * float64(ref[i])
+			}
+			if er > 1e-6*float64(n) {
+				if db := 10 * math.Log10(eo/er); math.Abs(db) > 1 {
+					t.Errorf("audio is %+.1f dB from the oracle's level", db)
+				}
 			}
 		})
 	}

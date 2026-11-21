@@ -9,9 +9,12 @@ import (
 // ToStereo maps interleaved audio with the given channel count to
 // interleaved stereo. Mono is duplicated; stereo is copied. Multichannel
 // input is assumed to be in the usual order (L R C LFE Ls Rs [more
-// surround pairs]) and is downmixed with the centre and surrounds at -3 dB,
-// the LFE dropped, and the result normalised so it cannot clip. The result
-// is always a new slice.
+// surround pairs]) and is downmixed with the ITU-R BS.775 coefficients:
+// front left and right at unity, the centre and surrounds at -3 dB, the LFE
+// dropped. The matrix is not normalised, so the programme keeps the level
+// other players give it (normalising cost 7.7 dB for 5.1); a loud mix can
+// therefore exceed full scale, which the mixer's SoftClip handles
+// (SPEC §14.1). The result is always a new slice.
 func ToStereo(in []float32, channels int) []float32 {
 	if channels < 1 {
 		channels = 1
@@ -50,16 +53,6 @@ func ToStereo(in []float32, channels int) []float32 {
 				gr[c] = a
 			}
 		}
-	}
-	var sl, sr float32
-	for c := 0; c < channels; c++ {
-		sl += gl[c]
-		sr += gr[c]
-	}
-	norm := 1 / float32(math.Max(float64(sl), float64(sr)))
-	for c := range gl {
-		gl[c] *= norm
-		gr[c] *= norm
 	}
 	for i := 0; i < frames; i++ {
 		fr := in[i*channels : (i+1)*channels]

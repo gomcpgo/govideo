@@ -189,15 +189,23 @@ func esDescriptor(asc []byte) []byte {
 }
 
 // aacChannelOrder maps, per channel count, each output position in the
-// conventional order (L R C LFE Ls Rs, then extra front or side pairs) to
-// its position in the order AAC codes the channels (centre first, LFE last:
+// conventional order (L R C LFE Ls Rs, then extra surround pairs) to its
+// position in the order AAC codes the channels (centre first, LFE last:
 // ISO/IEC 14496-3 Table 1.19), which is the order the decoder delivers.
+//
+// Eight channels are read as 7.1 with side and back surrounds, the front
+// pair coded straight after the centre. That is channelConfiguration 12,
+// and it is also what files signalling configuration 7 carry in practice
+// (the table defines 7 as five front channels, L and R coded after Lc and
+// Rc, but real files and other decoders do not use it that way). Reading
+// them the other way sent the front pair through the downmix at -3 dB and
+// the side surrounds at unity (govideo#2).
 var aacChannelOrder = map[int][]int{
 	3: {1, 2, 0},                // C L R
 	4: {1, 2, 0, 3},             // C L R Cs
 	5: {1, 2, 0, 3, 4},          // C L R Ls Rs
 	6: {1, 2, 0, 5, 3, 4},       // C L R Ls Rs LFE
-	8: {3, 4, 0, 7, 5, 6, 1, 2}, // C Lc Rc L R Ls Rs LFE
+	8: {1, 2, 0, 7, 3, 4, 5, 6}, // C L R Ls Rs Lb Rb LFE
 }
 
 func (d *atDecoder) supply(packets *uint32, data *audioBufferList, desc *unsafe.Pointer) uintptr {

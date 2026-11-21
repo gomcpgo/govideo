@@ -89,25 +89,35 @@ func TestTruncatedFile(t *testing.T) {
 }
 
 // TestMultichannelAACOrder checks that 5.1 AAC, which codes the centre
-// channel first, is downmixed with left on the left.
+// channel first, is downmixed with left on the left, and at the ITU-R
+// BS.775 levels without normalisation (govideo#2): fronts at unity, centre
+// and surrounds at -3 dB.
 func TestMultichannelAACOrder(t *testing.T) {
 	oracle.Require(t)
 	requireOS(t)
 	dir := t.TempDir()
+	const h = math.Sqrt2 / 2
+	// lavfi's sine has a peak of 1/8.
+	const tone = 0.125 / math.Sqrt2
 	for _, c := range []struct {
-		channel     string
-		left, right float64 // expected share of the tone in each output channel
-	}{{"FL", 1, 0}, {"FR", 0, 1}, {"FC", 1, 1}, {"BL", 1, 0}, {"BR", 0, 1}, {"LFE", 0, 0}} {
-		t.Run(c.channel, func(t *testing.T) {
-			in := filepath.Join(dir, c.channel+".m4a")
-			if err := oracle.TryFFmpeg("-f", "lavfi", "-i", "sine=f=440:d=2:r=48000", "-af", "pan=5.1|"+c.channel+"=c0",
+		layout, channel string
+		left, right     float64 // expected gain of the tone into each output channel
+	}{
+		{"5.1", "FL", 1, 0}, {"5.1", "FR", 0, 1}, {"5.1", "FC", h, h},
+		{"5.1", "BL", h, 0}, {"5.1", "BR", 0, h}, {"5.1", "LFE", 0, 0},
+		{"7.1", "FL", 1, 0}, {"7.1", "FR", 0, 1}, {"7.1", "FC", h, h}, {"7.1", "LFE", 0, 0},
+		{"7.1", "SL", h, 0}, {"7.1", "SR", 0, h}, {"7.1", "BL", h, 0}, {"7.1", "BR", 0, h},
+	} {
+		t.Run(c.layout+"_"+c.channel, func(t *testing.T) {
+			in := filepath.Join(dir, c.layout+c.channel+".m4a")
+			if err := oracle.TryFFmpeg("-f", "lavfi", "-i", "sine=f=440:d=2:r=48000", "-af", "pan="+c.layout+"|"+c.channel+"=c0",
 				"-c:a", "aac", "-b:a", "256k", in); err != nil {
-				t.Skipf("the oracle cannot make 5.1 AAC: %v", err)
+				t.Skipf("the oracle cannot make %s AAC: %v", c.layout, err)
 			}
 			tl := govideo.NewTimeline(govideo.Canvas{Width: 320, Height: 180, FrameRate: govideo.R(30, 1)})
 			tl.AddGenerated(2*time.Second, govideo.GenerateOptions{})
 			tl.AddAudio(in, govideo.AudioOptions{})
-			out := filepath.Join(dir, c.channel+".mov")
+			out := filepath.Join(dir, c.layout+c.channel+".mov")
 			if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
 				t.Fatal(err)
 			}
@@ -123,6 +133,14 @@ func TestMultichannelAACOrder(t *testing.T) {
 			gl, gr := level(l), level(r)
 			if (gl > 0.005) != (c.left > 0) || (gr > 0.005) != (c.right > 0) {
 				t.Errorf("tone in %s came out at left %.4f, right %.4f", c.channel, gl, gr)
+			}
+			for _, side := range []struct{ got, gain float64 }{{gl, c.left}, {gr, c.right}} {
+				if side.gain == 0 {
+					continue
+				}
+				if db := 20 * math.Log10(side.got/(tone*side.gain)); math.Abs(db) > 0.5 {
+					t.Errorf("tone in %s is %+.2f dB from the BS.775 downmix level (left %.4f, right %.4f)", c.channel, db, gl, gr)
+				}
 			}
 		})
 	}
