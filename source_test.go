@@ -53,6 +53,9 @@ func TestSeekSync(t *testing.T) {
 		t.Logf("%s: reading starts at %v", name, p.pts)
 		got[name] = p.pts
 	}
+	if len(got) == 0 {
+		t.Skip("the oracle could make none of the fixtures")
+	}
 	if a, b := got["gop.mp4"], got["gop.mkv"]; a != 0 && b != 0 && (a-b > time.Millisecond || b-a > time.Millisecond) {
 		t.Errorf("MP4 seeks to %v, Matroska to %v", a, b)
 	}

@@ -30,6 +30,12 @@ type PacketReader struct {
 	queue []*Packet
 	done  bool
 	err   error
+
+	// After a seek, the blocks of seekTrack are dropped up to its keyframe
+	// at seekTS (ticks): they belong to earlier groups of pictures.
+	seeking   bool
+	seekTrack uint64
+	seekTS    int64
 }
 
 // NewReader returns a reader positioned at the first cluster. Readers are
@@ -49,36 +55,39 @@ func (f *File) NewReaderContext(ctx context.Context) *PacketReader {
 	}}
 }
 
-// NewReaderAt returns a reader that starts at the Cluster holding the last
-// keyframe of a video track presented at or before t, so that a decoder need
-// not start from the beginning of the file. The keyframes come from Open's
-// scan of every Cluster rather than from Cues, which files written live lack
-// and which may list only some keyframes.
+// NewReaderAt returns a reader that starts at the last keyframe of a video
+// track presented at or before t, so that a decoder need not start from the
+// beginning of the file. The keyframes come from Open's scan of every Cluster
+// rather than from Cues, which files written live lack and which may list
+// only some keyframes.
 //
-// Packets of the track that precede the keyframe in its Cluster belong to the
-// previous group of pictures: decoding starts at the first packet of the track
-// with Keyframe set. ok is false when the scan found no keyframe at or before
-// t; the reader then starts at the first Cluster, as NewReaderContext's does.
+// Reading starts at the Cluster that holds the keyframe. The packets of the
+// track that precede the keyframe there belong to earlier groups of pictures
+// and are skipped, so the first packet of the track is the keyframe; the
+// other tracks are read from the start of the Cluster. ok is false when the
+// scan found no keyframe at or before t; the reader then starts at the first
+// Cluster, as NewReaderContext's does.
 func (f *File) NewReaderAt(ctx context.Context, track uint64, t time.Duration) (pr *PacketReader, ok bool) {
 	pr = f.NewReaderContext(ctx)
 	tr := f.byNum[track]
 	if tr == nil {
 		return pr, false
 	}
-	pos := int64(-1)
-	for _, sp := range tr.seek {
+	var at *seekPoint
+	for i := range tr.seek {
 		// Keyframes come in presentation order in any sane file; stopping
 		// at the first one past t keeps an out-of-order index safe, since
 		// starting early only costs time.
-		if f.ticks(sp.ts) > t {
+		if f.ticks(tr.seek[i].ts) > t {
 			break
 		}
-		pos = sp.pos
+		at = &tr.seek[i]
 	}
-	if pos < 0 {
+	if at == nil {
 		return pr, false
 	}
-	pr.w.pos = pos
+	pr.w.pos = at.pos
+	pr.seeking, pr.seekTrack, pr.seekTS = true, track, at.ts
 	return pr, true
 }
 
@@ -105,6 +114,12 @@ func (pr *PacketReader) Next() (*Packet, error) {
 				pr.err = pr.w.rd.err
 			}
 			return nil, pr.err
+		}
+		if pr.seeking && b.track == pr.seekTrack {
+			if !b.key || b.ts != pr.seekTS {
+				continue
+			}
+			pr.seeking = false
 		}
 		t := pr.f.byNum[b.track]
 		if t != nil && t.Err != nil {

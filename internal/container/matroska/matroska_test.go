@@ -433,7 +433,7 @@ func TestOpenSkipsPayloads(t *testing.T) {
 }
 
 // TestNewReaderAt checks the keyframe index built by Open's scan: a seek
-// starts at the Cluster of the last keyframe at or before the time asked for.
+// starts the track at its last keyframe at or before the time asked for.
 func TestNewReaderAt(t *testing.T) {
 	data := bytes.Join([][]byte{
 		header("webm"),
@@ -444,58 +444,67 @@ func TestNewReaderAt(t *testing.T) {
 				simpleBlock(2, 0, 0x80, []byte("a0")),
 				simpleBlock(1, 50, 0, []byte("f1"))),
 			// The Cluster opens with the end of the previous group of
-			// pictures; its keyframe comes second.
+			// pictures and holds two keyframes, as Clusters cut by time do.
 			el(idCluster, el(idTimestamp, u(100)),
 				simpleBlock(1, 0, 0, []byte("f2")),
+				simpleBlock(2, 10, 0x80, []byte("a1")),
 				simpleBlock(1, 33, 0x80, []byte("f3")),
-				simpleBlock(2, 40, 0x80, []byte("a1")),
-				simpleBlock(1, 66, 0, []byte("f4"))),
+				simpleBlock(1, 50, 0, []byte("f4")),
+				simpleBlock(2, 60, 0x80, []byte("a2")),
+				simpleBlock(1, 66, 0x80, []byte("f5")),
+				simpleBlock(1, 80, 0, []byte("f6"))),
 			el(idCluster, el(idTimestamp, u(200)), // no keyframe
-				simpleBlock(1, 0, 0, []byte("f5"))),
+				simpleBlock(1, 0, 0, []byte("f7"))),
 			el(idCluster, el(idTimestamp, u(300)),
-				el(idBlockGroup, el(idBlock, []byte{0x81, 0, 0, 0}, []byte("f6")))),
+				el(idBlockGroup, el(idBlock, []byte{0x81, 0, 0, 0}, []byte("f8")))),
 		),
 	}, nil)
 	f := open(t, data)
 	ms := time.Millisecond
 	for _, c := range []struct {
-		track      uint64
-		at         time.Duration
-		ok         bool
-		first, key string // first packet of the track, and its first keyframe
+		track uint64
+		at    time.Duration
+		ok    bool
+		video string // first packet of the video track
+		audio string // first packet of the audio track
 	}{
-		{1, 0, true, "f0", "f0"},
-		{1, 120 * ms, true, "f0", "f0"}, // the keyframe in the second Cluster is later
-		{1, 133 * ms, true, "f2", "f3"},
-		{1, 299 * ms, true, "f2", "f3"},
-		{1, 300 * ms, true, "f6", "f6"},
-		{1, time.Hour, true, "f6", "f6"},
-		{2, time.Hour, false, "a0", "a0"}, // audio is not indexed
-		{9, time.Hour, false, "f0", "f0"}, // no such track
+		{1, 0, true, "f0", "a0"},
+		{1, 132 * ms, true, "f0", "a0"}, // the keyframes of the second Cluster are later
+		{1, 133 * ms, true, "f3", "a1"}, // other tracks start with the Cluster
+		{1, 165 * ms, true, "f3", "a1"},
+		{1, 166 * ms, true, "f5", "a1"}, // the second keyframe of a Cluster
+		{1, 299 * ms, true, "f5", "a1"},
+		{1, 300 * ms, true, "f8", ""},
+		{1, time.Hour, true, "f8", ""},
+		{2, time.Hour, false, "f0", "a0"}, // audio is not indexed
+		{9, time.Hour, false, "f0", "a0"}, // no such track
 	} {
 		pr, ok := f.NewReaderAt(context.Background(), c.track, c.at)
-		var first, key string
-		for first == "" || key == "" {
+		var video, audio *Packet
+		for {
 			p, err := pr.Next()
 			if err != nil {
 				break
 			}
-			want := c.track
-			if want == 9 {
-				want = 1
+			if p.Track == 1 && video == nil {
+				video = p
 			}
-			if p.Track != want {
-				continue
-			}
-			if first == "" {
-				first = string(p.Data)
-			}
-			if key == "" && p.Keyframe {
-				key = string(p.Data)
+			if p.Track == 2 && audio == nil {
+				audio = p
 			}
 		}
-		if ok != c.ok || first != c.first || key != c.key {
-			t.Errorf("track %d at %v: ok=%v first %q key %q, want %v %q %q", c.track, c.at, ok, first, key, c.ok, c.first, c.key)
+		name := func(p *Packet) string {
+			if p == nil {
+				return ""
+			}
+			return string(p.Data)
+		}
+		if ok != c.ok || name(video) != c.video || name(audio) != c.audio {
+			t.Errorf("track %d at %v: ok=%v video %q audio %q, want %v %q %q",
+				c.track, c.at, ok, name(video), name(audio), c.ok, c.video, c.audio)
+		}
+		if ok && (video == nil || !video.Keyframe || video.Timestamp > c.at) {
+			t.Errorf("track %d at %v: reading starts at %+v, want a keyframe at or before the time", c.track, c.at, video)
 		}
 	}
 

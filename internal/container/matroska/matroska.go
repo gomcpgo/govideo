@@ -139,10 +139,10 @@ type Track struct {
 	seek  []seekPoint // keyframe index, in file order (video tracks only)
 }
 
-// seekPoint is a place a decoder can start: a Cluster and the timestamp of
-// the track's first keyframe in it.
+// seekPoint is a place a decoder can start: a keyframe of the track and the
+// Cluster that holds it.
 type seekPoint struct {
-	ts  int64 // ticks
+	ts  int64 // the keyframe's timestamp, in ticks
 	pos int64 // offset of the Cluster element
 }
 
@@ -290,11 +290,10 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 			st.haveFirst = true
 			st.first = firstFrame(rd, b)
 		}
-		// The keyframe index takes the first keyframe of each Cluster. A
-		// full index stops growing: seeks past its end start earlier than
-		// they need to, which costs time but not correctness.
-		if t := f.byNum[b.track]; b.key && seekBudget > 0 && t != nil && t.Type == TrackVideo &&
-			(len(t.seek) == 0 || t.seek[len(t.seek)-1].pos != w.clusterPos) {
+		// The keyframe index takes every keyframe, since a Cluster may hold
+		// several. A full index stops growing: seeks past its end start
+		// earlier than they need to, which costs time but not correctness.
+		if t := f.byNum[b.track]; b.key && seekBudget > 0 && t != nil && t.Type == TrackVideo {
 			t.seek = append(t.seek, seekPoint{ts: b.ts, pos: w.clusterPos})
 			seekBudget--
 		}
