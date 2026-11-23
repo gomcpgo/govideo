@@ -85,3 +85,20 @@ func TestAudioKernels(t *testing.T) {
 		t.Errorf("gain/mix: %v", s)
 	}
 }
+
+func TestFieldMidRow(t *testing.T) {
+	a := []byte{10, 0, 255, 0, 100}
+	b := []byte{20, 0, 255, 255, 100}
+	c := []byte{30, 0, 255, 255, 101}
+	d := []byte{40, 255, 0, 0, 101}
+	// (-a + 9b + 9c - d + 8) / 16: a ramp is continued, overshoot is
+	// clipped, and halves round up.
+	want := []byte{25, 0, 255, 255, 101}
+	got := make([]byte, len(want))
+	FieldMidRow(got, a, b, c, d)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sample %d: %d, want %d", i, got[i], want[i])
+		}
+	}
+}

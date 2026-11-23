@@ -22,11 +22,34 @@ type Canvas struct {
 	Background    color.Color // shown in the padding and behind transparent stills; default black
 }
 
+// DeinterlaceMode says whether a clip's frames are taken to be interlaced:
+// two fields captured half a frame apart, one on the even rows and one on
+// the odd rows. Such a frame is shown as two pictures, one per field, each
+// with the other field's rows interpolated; shown whole, whatever moved
+// between the fields is drawn twice, as a comb.
+type DeinterlaceMode int
+
+const (
+	// DeinterlaceAuto follows the stream. H.264 says for every picture
+	// whether it is a pair of fields and which comes first; other codecs
+	// are shown as decoded.
+	DeinterlaceAuto DeinterlaceMode = iota
+	// DeinterlaceOff shows frames as they are decoded, for a stream marked
+	// interlaced whose pictures are not.
+	DeinterlaceOff
+	// DeinterlaceTopFirst and DeinterlaceBottomFirst treat every frame as two
+	// fields in the order named, for a stream that is interlaced but does
+	// not say so, or says it wrongly.
+	DeinterlaceTopFirst
+	DeinterlaceBottomFirst
+)
+
 // ClipOptions configures a clip added with AddClip.
 type ClipOptions struct {
-	Trim TimeRange // part of the source to use; the zero value uses all of it
-	Mute bool      // drop the clip's own audio
-	Gain float64   // linear gain for the clip's audio; 0 means 1.0
+	Trim        TimeRange       // part of the source to use; the zero value uses all of it
+	Mute        bool            // drop the clip's own audio
+	Gain        float64         // linear gain for the clip's audio; 0 means 1.0
+	Deinterlace DeinterlaceMode // how interlaced video is handled; the zero value follows the stream
 }
 
 // ImageOptions configures a still image added with AddImage.

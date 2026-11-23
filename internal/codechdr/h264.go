@@ -70,19 +70,44 @@ func h264ProfileName(profile int, constraints uint32) string {
 // ParseH264SPS parses an H.264 sequence parameter set NAL unit, including
 // its one-byte NAL header.
 func ParseH264SPS(nal []byte) (*Video, error) {
+	v, _, err := parseH264SPS(nal)
+	return v, err
+}
+
+// h264SPS holds the sequence parameter set fields that the syntax of slice
+// headers and picture timing SEI messages depends on (H.264 §7.3.3, §D.1.3).
+type h264SPS struct {
+	id                 uint32
+	separatePlanes     bool
+	frameNumBits       uint32 // log2_max_frame_num
+	pocType            uint32
+	pocLsbBits         uint32 // log2_max_pic_order_cnt_lsb
+	deltaPOCAlwaysZero bool
+	topToBottom        int32 // offset_for_top_to_bottom_field
+	frameMbsOnly       bool
+	mbaff              bool
+	picStructPresent   bool
+	// cpbDpbDelays reports that picture timing SEI messages start with
+	// cpb_removal_delay and dpb_output_delay, of the widths given.
+	cpbDpbDelays               bool
+	cpbDelayBits, dpbDelayBits int
+}
+
+func parseH264SPS(nal []byte) (*Video, *h264SPS, error) {
 	if len(nal) < 4 {
-		return nil, ErrTruncated
+		return nil, nil, ErrTruncated
 	}
 	if nal[0]&0x80 != 0 || nal[0]&0x1f != 7 {
-		return nil, invalid("not an H.264 SPS NAL unit")
+		return nil, nil, invalid("not an H.264 SPS NAL unit")
 	}
 	r := bits.NewReader(bits.RemoveEmulationPrevention(nal[1:]))
 	v := newVideo("h264")
+	sps := &h264SPS{}
 	profile := int(r.U(8))
 	constraints := r.U(8)
 	v.Level = int(r.U(8))
 	v.Profile = h264ProfileName(profile, constraints)
-	r.UE() // seq_parameter_set_id
+	sps.id = r.UE()
 
 	chroma := 1
 	separatePlanes := false
@@ -91,7 +116,7 @@ func ParseH264SPS(nal []byte) (*Video, error) {
 	case 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135:
 		chroma = int(r.UE())
 		if chroma > 3 {
-			return nil, invalid("chroma_format_idc %d", chroma)
+			return nil, nil, invalid("chroma_format_idc %d", chroma)
 		}
 		if chroma == 3 {
 			separatePlanes = r.Flag()
@@ -99,7 +124,7 @@ func ParseH264SPS(nal []byte) (*Video, error) {
 		bd := r.UE()
 		bdc := r.UE()
 		if bd > 6 || bdc > 6 {
-			return nil, invalid("bit depth")
+			return nil, nil, invalid("bit depth")
 		}
 		v.BitDepth = int(bd) + 8
 		r.Skip(1) // qpprime_y_zero_transform_bypass_flag
@@ -130,17 +155,19 @@ func ParseH264SPS(nal []byte) (*Video, error) {
 	}
 	v.Chroma = chromaName(chroma)
 
-	r.UE() // log2_max_frame_num_minus4
-	switch r.UE() {
+	sps.separatePlanes = separatePlanes
+	sps.frameNumBits = r.UE() + 4
+	sps.pocType = r.UE()
+	switch sps.pocType {
 	case 0:
-		r.UE()
+		sps.pocLsbBits = r.UE() + 4
 	case 1:
-		r.Skip(1)
+		sps.deltaPOCAlwaysZero = r.Flag()
 		r.SE()
-		r.SE()
+		sps.topToBottom = r.SE()
 		n := r.UE()
 		if n > 255 {
-			return nil, invalid("num_ref_frames_in_pic_order_cnt_cycle %d", n)
+			return nil, nil, invalid("num_ref_frames_in_pic_order_cnt_cycle %d", n)
 		}
 		for i := uint32(0); i < n; i++ {
 			r.SE()
@@ -151,13 +178,14 @@ func ParseH264SPS(nal []byte) (*Video, error) {
 	wMbs := r.UE()
 	hUnits := r.UE()
 	if wMbs >= 4096 || hUnits >= 4096 {
-		return nil, invalid("picture size")
+		return nil, nil, invalid("picture size")
 	}
 	frameMbsOnly := r.Flag()
+	sps.frameMbsOnly = frameMbsOnly
 	fieldMul := 1
 	if !frameMbsOnly {
 		fieldMul = 2
-		r.Skip(1) // mb_adaptive_frame_field_flag
+		sps.mbaff = r.Flag()
 		v.Interlaced = true
 	}
 	r.Skip(1) // direct_8x8_inference_flag
@@ -178,18 +206,18 @@ func ParseH264SPS(nal []byte) (*Video, error) {
 		cw := (uint64(l) + uint64(rt)) * uint64(ux)
 		ch := (uint64(t) + uint64(bt)) * uint64(uy)
 		if cw >= uint64(v.CodedWidth) || ch >= uint64(v.CodedHeight) {
-			return nil, invalid("cropping exceeds picture")
+			return nil, nil, invalid("cropping exceeds picture")
 		}
 		v.Width -= int(cw)
 		v.Height -= int(ch)
 	}
 	if r.Flag() { // vui_parameters_present_flag
-		h264VUI(r, v)
+		h264VUI(r, v, sps)
 	}
 	if err := r.Err(); err != nil {
-		return nil, ErrTruncated
+		return nil, nil, ErrTruncated
 	}
-	return v, nil
+	return v, sps, nil
 }
 
 // vuiCommon parses the part of the VUI that H.264 and H.265 share:
@@ -226,7 +254,9 @@ func vuiCommon(r *bits.Reader, v *Video) {
 	}
 }
 
-func h264HRD(r *bits.Reader) {
+// h264HRD reads hrd_parameters (H.264 §E.1.2), keeping the widths of the two
+// delays that picture timing SEI messages carry.
+func h264HRD(r *bits.Reader, sps *h264SPS) {
 	n := r.UE()
 	if n > 31 {
 		r.Skip(1 << 30) // force an error
@@ -238,10 +268,14 @@ func h264HRD(r *bits.Reader) {
 		r.UE()
 		r.Skip(1)
 	}
-	r.Skip(20)
+	r.Skip(5) // initial_cpb_removal_delay_length_minus1
+	sps.cpbDpbDelays = true
+	sps.cpbDelayBits = int(r.U(5)) + 1
+	sps.dpbDelayBits = int(r.U(5)) + 1
+	r.Skip(5) // time_offset_length
 }
 
-func h264VUI(r *bits.Reader, v *Video) {
+func h264VUI(r *bits.Reader, v *Video, sps *h264SPS) {
 	vuiCommon(r, v)
 	if r.Flag() { // timing_info_present_flag
 		units := r.U(32)
@@ -261,16 +295,16 @@ func h264VUI(r *bits.Reader, v *Video) {
 	}
 	nal := r.Flag()
 	if nal {
-		h264HRD(r)
+		h264HRD(r, sps)
 	}
 	vcl := r.Flag()
 	if vcl {
-		h264HRD(r)
+		h264HRD(r, sps)
 	}
 	if nal || vcl {
 		r.Skip(1) // low_delay_hrd_flag
 	}
-	r.Skip(1)     // pic_struct_present_flag
+	sps.picStructPresent = r.Flag()
 	if r.Flag() { // bitstream_restriction_flag
 		r.Skip(1)
 		r.UE()
