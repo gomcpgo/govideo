@@ -37,6 +37,7 @@ const (
 	maxTags         = 4096
 	maxStatTracks   = 256
 	maxVFRSamples   = 1 << 21 // timestamps kept for VFR detection, all tracks
+	maxSeekPoints   = 1 << 18 // keyframe index entries, all tracks
 	firstFrameLen   = 64
 )
 
@@ -133,8 +134,16 @@ type Track struct {
 	// skips the packets of such tracks.
 	Err error
 
-	strip []byte // header-stripping compression: bytes to prepend to frames
-	zlib  bool   // frames are zlib-compressed
+	strip []byte      // header-stripping compression: bytes to prepend to frames
+	zlib  bool        // frames are zlib-compressed
+	seek  []seekPoint // keyframe index, in file order (video tracks only)
+}
+
+// seekPoint is a place a decoder can start: a keyframe of the track and the
+// Cluster that holds it.
+type seekPoint struct {
+	ts  int64 // the keyframe's timestamp, in ticks
+	pos int64 // offset of the Cluster element
 }
 
 type trackStats struct {
@@ -223,6 +232,7 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 		nTags                int
 		stats                = map[uint64]*trackStats{}
 		vfrBudget            = maxVFRSamples
+		seekBudget           = maxSeekPoints
 		perr                 error
 	)
 	w := &walker{rd: rd, ctx: ctx, pos: f.segStart, segEnd: f.segEnd}
@@ -279,6 +289,13 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 		if !st.haveFirst {
 			st.haveFirst = true
 			st.first = firstFrame(rd, b)
+		}
+		// The keyframe index takes every keyframe, since a Cluster may hold
+		// several. A full index stops growing: seeks past its end start
+		// earlier than they need to, which costs time but not correctness.
+		if t := f.byNum[b.track]; b.key && seekBudget > 0 && t != nil && t.Type == TrackVideo {
+			t.seek = append(t.seek, seekPoint{ts: b.ts, pos: w.clusterPos})
+			seekBudget--
 		}
 	}
 	if perr != nil {

@@ -36,6 +36,7 @@ type walker struct {
 	onTop func(id uint32, off, size int64)
 
 	inCluster  bool
+	clusterPos int64 // offset of the current Cluster's element header
 	clusterEnd int64 // -1 = unknown size
 	clusterTS  int64
 	n          int
@@ -71,6 +72,7 @@ func (w *walker) next() (block, bool) {
 		if !w.inCluster {
 			if id == idCluster {
 				w.inCluster = true
+				w.clusterPos = w.pos
 				w.clusterTS = 0
 				w.clusterEnd = -1
 				if size >= 0 {

@@ -158,7 +158,7 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 				if t.Err != nil {
 					return nil, t.Err
 				}
-				return &mkvReader{pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
+				return &mkvReader{f: m.mkv, ctx: ctx, pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
 			}
 		}
 	case m.wv != nil:
@@ -255,15 +255,22 @@ func (r *isoReader) time(t int64) time.Duration {
 	return r.shift + time.Duration(float64(t-r.mediaStart)/float64(r.ts)*1e9)
 }
 
-// seekSync positions the reader on the last sync sample presented at or
-// before t, so a decoder need not start from the beginning of the file. It
-// must be called before the first next.
+// syncSeeker is a packetReader that can start at a sync sample.
+type syncSeeker interface {
+	// seekSync positions the reader on the last sync sample presented at
+	// or before t, so a decoder need not start from the beginning of the
+	// file. It must be called before the first next.
+	seekSync(t time.Duration)
+}
+
 func (r *isoReader) seekSync(t time.Duration) {
 	it := r.tr.Iter()
 	skip := 0
 	for i := 0; ; i++ {
 		s, err := it.Next()
-		if err != nil || r.time(s.DTS) > t {
+		// The index of a file cut short lists samples that were never
+		// written; reading has to start where there is something to read.
+		if err != nil || r.time(s.DTS) > t || !r.f.Present(s) {
 			break
 		}
 		if s.Sync && r.time(s.PTS()) <= t {
@@ -278,6 +285,8 @@ func (r *isoReader) seekSync(t time.Duration) {
 }
 
 type mkvReader struct {
+	f     *matroska.File
+	ctx   context.Context
 	pr    *matroska.PacketReader
 	track uint64
 	// delay is the track's CodecDelay: block timestamps are that much later
@@ -293,8 +302,14 @@ func (r *mkvReader) next() (packet, error) {
 			return packet{}, err
 		}
 		if p.Track == r.track {
-			return packet{pts: p.Timestamp - r.delay, data: p.Data}, nil
+			return packet{pts: p.Timestamp - r.delay, data: p.Data, sync: p.Keyframe}, nil
 		}
+	}
+}
+
+func (r *mkvReader) seekSync(t time.Duration) {
+	if pr, ok := r.f.NewReaderAt(r.ctx, r.track, t+r.delay); ok {
+		r.pr = pr
 	}
 }
 
@@ -504,6 +519,16 @@ type videoStream struct {
 	flushed bool
 	eof     bool
 
+	// After a seek, reading starts at a sync sample. When that is not an
+	// IDR picture, the packets that follow it but are presented before it
+	// (the leading pictures of an open group of pictures) refer to pictures
+	// the seek skipped. They are dropped: none is shown, as the sync sample
+	// is at or before the start, and a system decoder that is fed them can
+	// fail on every frame after.
+	seeked   bool          // the next packet is the one a seek landed on
+	dropLead bool          // drop the packets presented before leadEnd
+	leadEnd  time.Duration // presentation time of the sync sample
+
 	cur, peek *vframe
 	seq       int64
 	shown     *codec.VideoFrame
@@ -539,8 +564,9 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
-	if ir, ok := rd.(*isoReader); ok && start > 0 {
-		ir.seekSync(start)
+	if sk, ok := rd.(syncSeeker); ok && start > 0 {
+		sk.seekSync(start)
+		v.seeked = true
 	}
 	return v, nil
 }
@@ -552,18 +578,29 @@ func (v *videoStream) close() {
 }
 
 func (v *videoStream) pull() (*packet, error) {
-	if v.eof {
-		return nil, nil
+	for {
+		if v.eof {
+			return nil, nil
+		}
+		p, err := v.rd.next()
+		if err == io.EOF {
+			v.eof = true
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if v.seeked {
+			// The first packet after a seek is the sync sample.
+			v.seeked = false
+			if p.sync && p.pts <= v.start {
+				v.dropLead, v.leadEnd = true, p.pts
+			}
+		} else if v.dropLead && p.pts < v.leadEnd {
+			continue
+		}
+		return &p, nil
 	}
-	p, err := v.rd.next()
-	if err == io.EOF {
-		v.eof = true
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &p, nil
 }
 
 // next returns the following frame in presentation order, or nil at the end.
@@ -618,9 +655,8 @@ func (v *videoStream) next() (*vframe, error) {
 			v.look = v.look[1:]
 			frames, err = v.dec.Decode(p.data, p.pts)
 			if err != nil && p.pts < v.start {
-				// Pictures before the start are only decoded as references.
-				// After a seek some of them refer to the previous group of
-				// pictures and cannot be decoded; they are not needed.
+				// Pictures before the start are only decoded as references:
+				// one that cannot be decoded is not needed for itself.
 				err = nil
 			}
 		case !v.flushed:

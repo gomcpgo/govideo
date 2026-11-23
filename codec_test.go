@@ -398,7 +398,7 @@ func TestDecodeOSCodecs(t *testing.T) {
 	}{
 		{"h264_bframes.mp4", cat([]string{"-vf", tv709}, x264, []string{"-bf", "3", "-b_strategy", "0", "-g", "45"}, tag709, aac), 14},
 		{"h264_baseline.mp4", cat([]string{"-vf", tv709}, x264, []string{"-profile:v", "baseline"}, tag709, aac), 14},
-		{"h264_bpyramid_mkv.mkv", cat([]string{"-vf", tv709}, x264, []string{"-bf", "5", "-b-pyramid", "normal", "-refs", "4"}, tag709, aac), 14},
+		{"h264_bpyramid_mkv.mkv", cat([]string{"-vf", tv709}, x264, []string{"-bf", "5", "-b-pyramid", "normal", "-refs", "4", "-g", "20"}, tag709, aac), 14},
 		{"h264_bt601.mp4", cat([]string{"-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=tv:out_color_matrix=bt601"}, x264,
 			[]string{"-colorspace", "smpte170m", "-color_primaries", "smpte170m", "-color_trc", "smpte170m", "-color_range", "tv"}, aac), 14},
 		{"h264_fullrange.mp4", cat([]string{"-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=full:out_color_matrix=bt709"},
