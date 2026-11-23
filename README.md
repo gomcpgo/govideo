@@ -57,7 +57,7 @@ err := tl.Export(ctx, "out.mp4", govideo.ExportOptions{
 
 What works today:
 
-- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
+- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Interlaced H.264 is deinterlaced: each frame is shown as its two fields, in the order the stream gives, so a 50 or 60 fps canvas keeps all of the motion and a slower one shows no combing. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
 - **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration. Transparent parts show the canvas background colour.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
 - **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
@@ -68,7 +68,7 @@ What works today:
   - `ProfileIntermediate`: Motion JPEG + 16-bit LPCM, using only native codecs, on every platform. The files are large; this is a format that editors and ffmpeg read, not a delivery format.
   - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
 
-Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
+Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; deinterlacing rebuilds each field on its own, so a stream marked interlaced whose pictures are not loses vertical detail (set `ClipOptions.Deinterlace` to `DeinterlaceOff` for such a clip, or to a field order for an interlaced stream that is not marked); H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
 Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
@@ -88,9 +88,9 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
-| 3 | MPEG-TS, interlaced sources, AC-3, ProRes via macOS, and other archive formats |
+| 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |
 
 A JSON project file for describing builds, and a small command line for simple operations, are planned.

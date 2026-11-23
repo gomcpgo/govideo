@@ -500,12 +500,26 @@ type vframe struct {
 	pts   time.Duration
 	data  []byte
 	frame *codec.VideoFrame
+	// order says whether the frame is a pair of fields. Such a frame is
+	// delivered as two vframes, one per field (bob), which share the decoded
+	// frame: twin is the second field's, for the first to pass a lazily
+	// decoded frame on to.
+	order codechdr.FieldOrder
+	bob   bool
+	field process.Field
+	twin  *vframe
 }
 
 // videoStream selects, for a rising sequence of times, the source frame to
 // show. Intra-only codecs are decoded lazily, only when a frame is selected.
 // Inter-frame codecs are decoded in full, in decode order, and the pictures
 // are put back into presentation order here.
+//
+// An interlaced frame counts as two pictures, its fields, the second half a
+// frame after the first (SPEC §7.1). Which of them an output frame shows is
+// chosen by time like any other picture, so an output at the field rate
+// shows every field and one at the frame rate shows one field of each
+// frame.
 type videoStream struct {
 	rd       packetReader
 	intra    codec.VideoDecoder       // intra-only codecs
@@ -530,6 +544,19 @@ type videoStream struct {
 	dropLead bool          // drop the packets presented before leadEnd
 	leadEnd  time.Duration // presentation time of the sync sample
 
+	// Deinterlacing. force is the field order to assume for every frame, if
+	// the clip names one. Otherwise pics, when set, reads the structure of
+	// each H.264 picture on its way into the decoder, and orders holds the
+	// field order of the interlaced ones until they come out, by
+	// presentation time.
+	force    codechdr.FieldOrder
+	pics     *codechdr.H264Pictures
+	orders   map[time.Duration]codechdr.FieldOrder
+	second   *vframe       // the second field of the frame last split
+	ahead    *vframe       // the frame after it, read to learn its length
+	frameDur time.Duration // nominal frame length; 0 when unknown
+	lastDur  time.Duration // length of the frame last split
+
 	cur, peek *vframe
 	seq       int64
 	shown     *codec.VideoFrame
@@ -539,7 +566,7 @@ type videoStream struct {
 // openVideo starts reading stream s of m; the first frame asked for will be
 // the one shown at start. slack is the tolerance of frame selection (see
 // frameAt).
-func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack time.Duration) (*videoStream, error) {
+func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack time.Duration, deint DeinterlaceMode) (*videoStream, error) {
 	ci, err := Available(CodecID(s.Codec), Decode)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
@@ -549,6 +576,24 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 		return nil, err
 	}
 	v := &videoStream{rd: rd, rotation: s.Video.Rotation, mirror: s.Video.Mirrored, start: start, slack: slack, shownSeq: -1}
+	if r := s.Video.FrameRate.Float(); r > 0 {
+		v.frameDur = time.Duration(1e9 / r)
+	}
+	switch deint {
+	case DeinterlaceTopFirst:
+		v.force = codechdr.TopFieldFirst
+	case DeinterlaceBottomFirst:
+		v.force = codechdr.BottomFieldFirst
+	case DeinterlaceAuto:
+		// The sequence parameter set says whether fields can occur at all;
+		// only then is every picture looked at.
+		if ci.ID == "h264" && s.Video.Interlaced {
+			if v.pics, err = codechdr.NewH264Pictures(m.config(s, "avcC")); err != nil {
+				v.pics = nil // no usable configuration: shown as decoded
+			}
+			v.orders = map[time.Duration]codechdr.FieldOrder{}
+		}
+	}
 	if ci.ID == "mjpeg" {
 		v.intra = native.MJPEGDecoder{}
 		return v, nil
@@ -604,14 +649,75 @@ func (v *videoStream) pull() (*packet, error) {
 	}
 }
 
-// next returns the following frame in presentation order, or nil at the end.
+// next returns the following picture in presentation order, or nil at the
+// end: a frame, or one field of an interlaced frame.
 func (v *videoStream) next() (*vframe, error) {
+	if f := v.second; f != nil {
+		v.second = nil
+		return f, nil
+	}
+	f := v.ahead
+	v.ahead = nil
+	if f == nil {
+		var err error
+		if f, err = v.nextFrame(); f == nil {
+			return nil, err
+		}
+	}
+	if f.order != codechdr.TopFieldFirst && f.order != codechdr.BottomFieldFirst {
+		return f, nil
+	}
+	// The second field is shown midway to the next frame, which is read
+	// ahead for its time. A much longer wait than a frame is a gap in the
+	// stream, not a slower field rate; the last frame has the length of the
+	// one before it.
+	var err error
+	if v.ahead, err = v.nextFrame(); err != nil {
+		return nil, err
+	}
+	dur := v.lastDur
+	if v.ahead != nil && v.ahead.pts > f.pts {
+		dur = v.ahead.pts - f.pts
+	}
+	if dur <= 0 || (v.frameDur > 0 && dur > 3*v.frameDur) {
+		dur = v.frameDur
+	}
+	v.lastDur = dur
+	second := *f
+	second.pts += dur / 2
+	f.field, second.field = process.TopField, process.BottomField
+	if f.order == codechdr.BottomFieldFirst {
+		f.field, second.field = process.BottomField, process.TopField
+	}
+	f.bob, second.bob = true, true
+	f.twin, v.second = &second, &second
+	return f, nil
+}
+
+// fieldOrder returns the field order of the frame presented at pts, which
+// has left the decoder, and forgets the frames before it.
+func (v *videoStream) fieldOrder(pts time.Duration) codechdr.FieldOrder {
+	if v.force != codechdr.Progressive {
+		return v.force
+	}
+	o := v.orders[pts]
+	for t := range v.orders {
+		if t <= pts {
+			delete(v.orders, t)
+		}
+	}
+	return o
+}
+
+// nextFrame returns the following frame in presentation order, or nil at the
+// end.
+func (v *videoStream) nextFrame() (*vframe, error) {
 	if v.intra != nil {
 		p, err := v.pull()
 		if p == nil {
 			return nil, err
 		}
-		return &vframe{pts: p.pts, data: p.data}, nil
+		return &vframe{pts: p.pts, data: p.data, order: v.force}, nil
 	}
 	for {
 		for !v.eof && len(v.look) < reorderWindow {
@@ -643,7 +749,7 @@ func (v *videoStream) next() (*vframe, error) {
 			if ready {
 				f := v.held[first]
 				v.held = append(v.held[:first], v.held[first+1:]...)
-				return &vframe{pts: f.PTS, frame: f.Frame}, nil
+				return &vframe{pts: f.PTS, frame: f.Frame, order: v.fieldOrder(f.PTS)}, nil
 			}
 		}
 		var (
@@ -654,6 +760,13 @@ func (v *videoStream) next() (*vframe, error) {
 		case len(v.look) > 0:
 			p := v.look[0]
 			v.look = v.look[1:]
+			if v.pics != nil {
+				// Every packet is read, in decode order: parameter sets can
+				// change on the way.
+				if o := v.pics.Picture(p.data).FieldOrder(); o == codechdr.TopFieldFirst || o == codechdr.BottomFieldFirst {
+					v.orders[p.pts] = o
+				}
+			}
 			frames, err = v.dec.Decode(p.data, p.pts)
 			if err != nil && p.pts < v.start {
 				// Pictures before the start are only decoded as references:
@@ -712,6 +825,12 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 			if f, err = v.intra.Decode(v.cur.data); err != nil {
 				return nil, 0, err
 			}
+			if v.cur.twin != nil {
+				v.cur.twin.frame = f
+			}
+		}
+		if v.cur.bob {
+			f = process.Bob(f, v.cur.field)
 		}
 		f = process.Rotate(f, v.rotation)
 		if v.mirror {

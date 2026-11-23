@@ -246,7 +246,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			}
 			sg.trim, dur = start, end-start
 			if vs != nil {
-				if sg.video, err = openVideo(ctx, m, vs, sg.origin+start, slack); err != nil {
+				if sg.video, err = openVideo(ctx, m, vs, sg.origin+start, slack, it.clip.Deinterlace); err != nil {
 					return err
 				}
 			} else {
