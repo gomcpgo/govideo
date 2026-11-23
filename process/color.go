@@ -83,26 +83,55 @@ func ToRGBA(f *codec.VideoFrame) *image.RGBA {
 	return img
 }
 
+// backdrop16 is a backdrop colour as the 16-bit premultiplied R'G'B' that
+// color.Color reports. Its alpha is ignored, which amounts to the colour
+// itself lying over black; nil is black. The top byte of each component is
+// what colorTo709 converts, so a fully transparent pixel composited over the
+// backdrop comes out exactly as the padding Fit draws in the same colour.
+func backdrop16(bg color.Color) (c [3]uint32) {
+	if bg != nil {
+		c[0], c[1], c[2], _ = bg.RGBA()
+	}
+	return c
+}
+
 // colorTo709 converts a colour (alpha ignored, composited over black) to
 // BT.709 limited-range Y'CbCr.
 func colorTo709(c color.Color) (y, cb, cr byte) {
 	if c == nil {
 		return 16, 128, 128
 	}
-	r, g, b, _ := c.RGBA()
-	px := [4]byte{byte(r >> 8), byte(g >> 8), byte(b >> 8), 255}
+	bg := backdrop16(c)
+	px := [4]byte{byte(bg[0] >> 8), byte(bg[1] >> 8), byte(bg[2] >> 8), 255}
 	var yy, u, v [1]byte
 	kernels.RGBAToYRow(yy[:], px[:], 1, &rgbTo709)
 	kernels.RGBAToCbCrRow(u[:], v[:], px[:], px[:], 1, &rgbTo709)
 	return yy[0], u[0], v[0]
 }
 
+// over16 composites one premultiplied 16-bit component over the backdrop
+// component bg, given the pixel's 16-bit alpha, and returns the top byte.
+func over16(c, a, bg uint32) byte {
+	if a < 0xffff && bg != 0 {
+		c = min(c+(bg*(0xffff-a)+0x7fff)/0xffff, 0xffff)
+	}
+	return byte(c >> 8)
+}
+
 // FromImage converts any image to a BT.709 limited-range 4:2:0 frame.
-// Transparent pixels are composited over black. JPEG-style *image.YCbCr
-// (BT.601 full range) is converted without an RGB round trip.
-func FromImage(img image.Image) *codec.VideoFrame {
+// Transparent pixels are composited over black; FromImageOver takes another
+// backdrop. JPEG-style *image.YCbCr (BT.601 full range) is converted without
+// an RGB round trip.
+func FromImage(img image.Image) *codec.VideoFrame { return FromImageOver(img, nil) }
+
+// FromImageOver is FromImage with transparent and translucent pixels
+// composited over bg (nil is black; bg's own alpha is ignored). The blend is
+// done on the gamma-encoded values, as browsers and image editors do. A
+// fully transparent pixel becomes exactly the colour Fit pads with, so a
+// still with a transparent margin meets the letterbox bars without a seam.
+func FromImageOver(img image.Image, bg color.Color) *codec.VideoFrame {
 	if o, ok := img.(*orientedImage); ok {
-		return applyOrientation(FromImage(o.src), o.o)
+		return applyOrientation(FromImageOver(o.src, bg), o.o)
 	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
@@ -112,17 +141,38 @@ func FromImage(img image.Image) *codec.VideoFrame {
 	switch m := img.(type) {
 	case *image.YCbCr:
 		return fromYCbCr(m)
+	case *image.NYCbCrA:
+		return fromNYCbCrA(m, true, bg)
 	case *image.Gray:
 		return fromGray(m)
 	}
 
-	// Everything else goes through premultiplied RGBX rows.
+	bg16 := backdrop16(bg)
+	bg8 := [3]uint32{bg16[0] >> 8, bg16[1] >> 8, bg16[2] >> 8}
+	black := bg8 == [3]uint32{}
+
+	// Everything else goes through RGBX rows already composited over bg.
 	var row func(y int, buf []byte) []byte
 	switch m := img.(type) {
 	case *image.RGBA:
-		row = func(y int, _ []byte) []byte {
+		row = func(y int, buf []byte) []byte {
 			o := m.PixOffset(b.Min.X, b.Min.Y+y)
-			return m.Pix[o : o+w*4]
+			src := m.Pix[o : o+w*4]
+			if black {
+				return src // premultiplied values are the picture over black
+			}
+			for i := 0; i < w*4; i += 4 {
+				na := 255 - uint32(src[i+3])
+				if na == 0 {
+					buf[i], buf[i+1], buf[i+2] = src[i], src[i+1], src[i+2]
+					continue
+				}
+				// min guards against invalid data (a component above its alpha).
+				buf[i] = byte(min(uint32(src[i])+(bg8[0]*na+127)/255, 255))
+				buf[i+1] = byte(min(uint32(src[i+1])+(bg8[1]*na+127)/255, 255))
+				buf[i+2] = byte(min(uint32(src[i+2])+(bg8[2]*na+127)/255, 255))
+			}
+			return buf
 		}
 	case *image.NRGBA:
 		row = func(y int, buf []byte) []byte {
@@ -134,35 +184,35 @@ func FromImage(img image.Image) *codec.VideoFrame {
 					buf[i], buf[i+1], buf[i+2] = src[i], src[i+1], src[i+2]
 					continue
 				}
-				buf[i] = byte((uint32(src[i])*a + 127) / 255)
-				buf[i+1] = byte((uint32(src[i+1])*a + 127) / 255)
-				buf[i+2] = byte((uint32(src[i+2])*a + 127) / 255)
+				na := 255 - a
+				buf[i] = byte((uint32(src[i])*a + bg8[0]*na + 127) / 255)
+				buf[i+1] = byte((uint32(src[i+1])*a + bg8[1]*na + 127) / 255)
+				buf[i+2] = byte((uint32(src[i+2])*a + bg8[2]*na + 127) / 255)
 			}
 			return buf
 		}
 	case *image.Paletted:
 		pal := make([][3]byte, len(m.Palette))
 		for i, c := range m.Palette {
-			r, g, bb, _ := c.RGBA()
-			pal[i] = [3]byte{byte(r >> 8), byte(g >> 8), byte(bb >> 8)}
+			r, g, bb, a := c.RGBA()
+			pal[i] = [3]byte{over16(r, a, bg16[0]), over16(g, a, bg16[1]), over16(bb, a, bg16[2])}
 		}
 		row = func(y int, buf []byte) []byte {
 			o := m.PixOffset(b.Min.X, b.Min.Y+y)
 			for x, idx := range m.Pix[o : o+w] {
+				var p [3]byte // an index past the palette is black, as image/png makes it
 				if int(idx) < len(pal) {
-					p := pal[idx]
-					buf[x*4], buf[x*4+1], buf[x*4+2] = p[0], p[1], p[2]
-				} else {
-					buf[x*4], buf[x*4+1], buf[x*4+2] = 0, 0, 0
+					p = pal[idx]
 				}
+				buf[x*4], buf[x*4+1], buf[x*4+2] = p[0], p[1], p[2]
 			}
 			return buf
 		}
 	default:
 		row = func(y int, buf []byte) []byte {
 			for x := 0; x < w; x++ {
-				r, g, bb, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-				buf[x*4], buf[x*4+1], buf[x*4+2] = byte(r>>8), byte(g>>8), byte(bb>>8)
+				r, g, bb, a := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+				buf[x*4], buf[x*4+1], buf[x*4+2] = over16(r, a, bg16[0]), over16(g, a, bg16[1]), over16(bb, a, bg16[2])
 			}
 			return buf
 		}
@@ -208,8 +258,63 @@ func fromYCbCr(m *image.YCbCr) *codec.VideoFrame { return convertYCbCr(m, true) 
 
 // FromVideoYCbCr converts a Y'CbCr image whose samples are BT.601 limited
 // range (16..235), as lossy WebP stores them. Go's image.YCbCr type has no
-// way to say so, and FromImage assumes the full range JPEG uses.
+// way to say so, and FromImage assumes the full range JPEG uses. For such
+// an image with an alpha plane see FromVideoNYCbCrA.
 func FromVideoYCbCr(m *image.YCbCr) *codec.VideoFrame { return convertYCbCr(m, false) }
+
+// FromVideoNYCbCrA is FromVideoYCbCr for an image with an alpha plane, as
+// lossy WebP with transparency decodes: the colour samples are BT.601
+// limited range, and the picture is composited over bg (nil is black) as
+// FromImageOver does.
+func FromVideoNYCbCrA(m *image.NYCbCrA, bg color.Color) *codec.VideoFrame {
+	return fromNYCbCrA(m, false, bg)
+}
+
+// fromNYCbCrA converts the colour planes like convertYCbCr and blends the
+// result over bg by the alpha plane. The samples are not premultiplied.
+// Blending Y'CbCr is the same as blending the R'G'B' it stands for, because
+// the conversion between them is affine and the two weights sum to one.
+func fromNYCbCrA(m *image.NYCbCrA, fullRange bool, bg color.Color) *codec.VideoFrame {
+	f := convertYCbCr(&m.YCbCr, fullRange) // always a new frame, so it can be blended in place
+	b := m.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return f
+	}
+	by, bcb, bcr := colorTo709(bg)
+	for y := 0; y < h; y++ {
+		o := m.AOffset(b.Min.X, b.Min.Y+y)
+		row := f.Y[y*f.YStride : y*f.YStride+w]
+		for x, a := range m.A[o : o+w] {
+			if a != 255 {
+				row[x] = byte((uint32(row[x])*uint32(a) + uint32(by)*uint32(255-a) + 127) / 255)
+			}
+		}
+	}
+	// A chroma sample covers a 2x2 block, so it takes the block's mean alpha.
+	cw, ch := f.ChromaSize()
+	for cy := 0; cy < ch; cy++ {
+		o0 := m.AOffset(b.Min.X, b.Min.Y+cy*2)
+		o1 := o0
+		if cy*2+1 < h {
+			o1 = m.AOffset(b.Min.X, b.Min.Y+cy*2+1)
+		}
+		a0, a1 := m.A[o0:o0+w], m.A[o1:o1+w]
+		dcb := f.Cb[cy*f.CStride : cy*f.CStride+cw]
+		dcr := f.Cr[cy*f.CStride : cy*f.CStride+cw]
+		for cx := range dcb {
+			x0 := cx * 2
+			x1 := min(x0+1, w-1)
+			a := uint32(a0[x0]) + uint32(a0[x1]) + uint32(a1[x0]) + uint32(a1[x1])
+			if a != 4*255 {
+				na := 4*255 - a
+				dcb[cx] = byte((uint32(dcb[cx])*a + uint32(bcb)*na + 2*255) / (4 * 255))
+				dcr[cx] = byte((uint32(dcr[cx])*a + uint32(bcr)*na + 2*255) / (4 * 255))
+			}
+		}
+	}
+	return f
+}
 
 func convertYCbCr(m *image.YCbCr, fullRange bool) *codec.VideoFrame {
 	b := m.Bounds()

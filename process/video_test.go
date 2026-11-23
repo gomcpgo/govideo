@@ -530,3 +530,143 @@ func TestFromVideoYCbCr(t *testing.T) {
 		t.Error("empty image")
 	}
 }
+
+// Transparent and translucent pixels show the backdrop in every pixel
+// layout FromImageOver has a path for, and a fully transparent pixel is
+// exactly the colour Fit pads with.
+func TestFromImageOver(t *testing.T) {
+	bg := color.NRGBA{32, 64, 192, 255}
+	by, bcb, bcr := colorTo709(bg)
+	clear := color.NRGBA{255, 0, 0, 0}      // the red underneath must not show
+	half := color.NRGBA{255, 255, 255, 128} // white at 128/255
+	mix := func(c, b uint8) uint8 { return uint8((int(c)*128 + int(b)*127 + 127) / 255) }
+	want := FromImage(solid(2, 2, color.NRGBA{mix(255, bg.R), mix(255, bg.G), mix(255, bg.B), 255}))
+	opaque := color.NRGBA{200, 40, 90, 255}
+
+	layouts := []struct {
+		name string
+		make func(c color.NRGBA) image.Image
+	}{
+		{"nrgba", func(c color.NRGBA) image.Image { return solid(6, 4, c) }},
+		{"rgba", func(c color.NRGBA) image.Image {
+			m := image.NewRGBA(image.Rect(0, 0, 6, 4))
+			for i := 0; i < 24; i++ {
+				m.Set(i%6, i/6, c)
+			}
+			return m
+		}},
+		{"paletted", func(c color.NRGBA) image.Image {
+			m := image.NewPaletted(image.Rect(0, 0, 6, 4), color.Palette{color.Black, c})
+			for i := range m.Pix {
+				m.Pix[i] = 1
+			}
+			return m
+		}},
+		{"nrgba64", func(c color.NRGBA) image.Image {
+			m := image.NewNRGBA64(image.Rect(0, 0, 6, 4))
+			for i := 0; i < 24; i++ {
+				m.Set(i%6, i/6, c)
+			}
+			return m
+		}},
+		{"nycbcra", func(c color.NRGBA) image.Image {
+			m := image.NewNYCbCrA(image.Rect(0, 0, 6, 4), image.YCbCrSubsampleRatio420)
+			yy, cb, cr := color.RGBToYCbCr(c.R, c.G, c.B)
+			for i := range m.Y {
+				m.Y[i], m.A[i] = yy, c.A
+			}
+			for i := range m.Cb {
+				m.Cb[i], m.Cr[i] = cb, cr
+			}
+			return m
+		}},
+	}
+	for _, l := range layouts {
+		checkSolid(t, l.name+"/transparent", FromImageOver(l.make(clear), bg), by, bcb, bcr, 0)
+		checkSolid(t, l.name+"/translucent", FromImageOver(l.make(half), bg), want.Y[0], want.Cb[0], want.Cr[0], 1)
+		checkSolid(t, l.name+"/transparent, no backdrop", FromImageOver(l.make(clear), nil), 16, 128, 128, 0)
+		if !sameFrame(FromImageOver(l.make(opaque), bg), FromImage(l.make(opaque))) {
+			t.Errorf("%s: the backdrop changed an opaque image", l.name)
+		}
+		if !sameFrame(FromImageOver(l.make(half), color.Black), FromImage(l.make(half))) {
+			t.Errorf("%s: a black backdrop differs from FromImage", l.name)
+		}
+		// The backdrop passes through the EXIF orientation fast path.
+		checkSolid(t, l.name+"/oriented", FromImageOver(Orient(l.make(clear), 6), bg), by, bcb, bcr, 0)
+
+		// Scaled and padded, a transparent image is indistinguishable from
+		// the padding around it.
+		for _, mode := range []FitMode{Contain, Cover, Stretch} {
+			checkSolid(t, l.name+"/fit", Fit(FromImageOver(l.make(clear), bg), 40, 18, mode, bg), by, bcb, bcr, 0)
+		}
+	}
+
+	// Per pixel: an opaque white column next to a transparent one, on an
+	// odd width so the last chroma sample covers a single column.
+	m := image.NewNRGBA(image.Rect(0, 0, 5, 3))
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 5; x++ {
+			if x < 2 {
+				m.SetNRGBA(x, y, color.NRGBA{255, 255, 255, 255})
+			}
+		}
+	}
+	f := FromImageOver(m, bg)
+	for y := 0; y < 3; y++ {
+		for x := 0; x < 5; x++ {
+			wantY := by
+			if x < 2 {
+				wantY = 235
+			}
+			if got := f.Y[y*f.YStride+x]; got != wantY {
+				t.Errorf("Y(%d,%d)=%d, want %d", x, y, got, wantY)
+			}
+		}
+		if cy := y / 2; f.Cb[cy*f.CStride] != 128 || f.Cb[cy*f.CStride+1] != bcb || f.Cb[cy*f.CStride+2] != bcb {
+			t.Errorf("Cb row %d = %v, want 128 then %d", cy, f.Cb[cy*f.CStride:cy*f.CStride+3], bcb)
+		}
+	}
+}
+
+// Lossy WebP with transparency decodes to an image.NYCbCrA whose colour
+// samples are limited range; they keep their levels and show the backdrop
+// where the alpha plane says so.
+func TestFromVideoNYCbCrA(t *testing.T) {
+	bg := color.NRGBA{32, 64, 192, 255}
+	by, bcb, bcr := colorTo709(bg)
+	m := image.NewNYCbCrA(image.Rect(0, 0, 8, 6), image.YCbCrSubsampleRatio420)
+	for i := range m.Y {
+		m.Y[i] = 235 // limited-range white
+		if i%8 < 4 {
+			m.A[i] = 255
+		}
+	}
+	for i := range m.Cb {
+		m.Cb[i], m.Cr[i] = 128, 128
+	}
+	f := FromVideoNYCbCrA(m, bg)
+	if f.Matrix != 1 || f.FullRange {
+		t.Errorf("frame tagged matrix=%d full=%v, want 709 limited", f.Matrix, f.FullRange)
+	}
+	for y := 0; y < 6; y++ {
+		for x := 0; x < 8; x++ {
+			wantY, wantCb, wantCr := by, bcb, bcr
+			if x < 4 {
+				wantY, wantCb, wantCr = 235, 128, 128
+			}
+			c := (y/2)*f.CStride + x/2
+			if f.Y[y*f.YStride+x] != wantY || f.Cb[c] != wantCb || f.Cr[c] != wantCr {
+				t.Fatalf("(%d,%d) = %d,%d,%d, want %d,%d,%d", x, y, f.Y[y*f.YStride+x], f.Cb[c], f.Cr[c], wantY, wantCb, wantCr)
+			}
+		}
+	}
+	// A sub-image keeps its own alpha offsets.
+	sub := m.SubImage(image.Rect(2, 2, 8, 6)).(*image.NYCbCrA)
+	g := FromVideoNYCbCrA(sub, bg)
+	if g.Width != 6 || g.Height != 4 || g.Y[0] != 235 || g.Y[1] != 235 || g.Y[2] != by || g.Cb[0] != 128 || g.Cb[1] != bcb {
+		t.Errorf("sub-image: %dx%d Y=%v Cb=%v", g.Width, g.Height, g.Y[:3], g.Cb[:2])
+	}
+	if e := FromVideoNYCbCrA(image.NewNYCbCrA(image.Rectangle{}, image.YCbCrSubsampleRatio420), bg); e.Width != 0 {
+		t.Error("empty image")
+	}
+}

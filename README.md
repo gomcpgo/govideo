@@ -58,7 +58,7 @@ err := tl.Export(ctx, "out.mp4", govideo.ExportOptions{
 What works today:
 
 - **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
-- **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration.
+- **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration. Transparent parts show the canvas background colour.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
 - **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
 - **Audio** from WAV files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.

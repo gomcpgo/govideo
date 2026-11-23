@@ -230,6 +230,83 @@ func TestExportEndToEnd(t *testing.T) {
 	}
 }
 
+// TestTransparentStill checks that the transparent parts of a still show
+// the canvas background (black by default), and that lossy WebP with an
+// alpha plane keeps its limited-range levels on the way.
+func TestTransparentStill(t *testing.T) {
+	oracle.Require(t)
+	dir := t.TempDir()
+	// 200x200: an opaque white square in a transparent margin that hides
+	// red, with a strip of half-transparent white along the top.
+	img := image.NewNRGBA(image.Rect(0, 0, 200, 200))
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 200; x++ {
+			switch {
+			case x >= 50 && x < 150 && y >= 50 && y < 150:
+				img.SetNRGBA(x, y, color.NRGBA{255, 255, 255, 255})
+			case y < 30:
+				img.SetNRGBA(x, y, color.NRGBA{255, 255, 255, 128})
+			default:
+				img.SetNRGBA(x, y, color.NRGBA{255, 0, 0, 0})
+			}
+		}
+	}
+	src := filepath.Join(dir, "logo.png")
+	f, err := os.Create(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := png.Encode(f, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stills := map[string]string{"png": src}
+	webp := filepath.Join(dir, "logo.webp")
+	if err := oracle.TryFFmpeg("-i", src, "-c:v", "libwebp", "-lossless", "0", "-quality", "95", "-pix_fmt", "yuva420p", webp); err != nil {
+		t.Logf("the oracle has no WebP encoder; testing PNG only: %v", err)
+	} else {
+		stills["webp"] = webp
+	}
+
+	blue := color.NRGBA{32, 64, 192, 255}
+	for kind, path := range stills {
+		for _, bg := range []struct {
+			name    string
+			c       color.Color
+			r, g, b int
+		}{{"default", nil, 0, 0, 0}, {"blue", blue, 32, 64, 192}} {
+			t.Run(kind+"/"+bg.name, func(t *testing.T) {
+				// The still fills the height: it covers x = 140..500.
+				tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1), Background: bg.c})
+				tl.AddImage(path, time.Second/2, govideo.ImageOptions{})
+				out := filepath.Join(dir, kind+"-"+bg.name+".mov")
+				if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+					t.Fatal(err)
+				}
+				half := func(v int) int { return (255*128 + v*127 + 127) / 255 }
+				for _, c := range []struct {
+					x, y    int
+					r, g, b int
+					what    string
+				}{
+					{40, 180, bg.r, bg.g, bg.b, "pillarbox"},
+					{180, 180, bg.r, bg.g, bg.b, "transparent margin"},
+					{460, 320, bg.r, bg.g, bg.b, "transparent margin, lower right"},
+					{320, 180, 255, 255, 255, "opaque square"},
+					{320, 26, half(bg.r), half(bg.g), half(bg.b), "half-transparent strip"},
+				} {
+					r, g, b := pixel(t, out, 0.2, 640, 360, c.x, c.y)
+					if !near(r, c.r, 12) || !near(g, c.g, 12) || !near(b, c.b, 12) {
+						t.Errorf("%s: got rgb(%d,%d,%d), want rgb(%d,%d,%d)", c.what, r, g, b, c.r, c.g, c.b)
+					}
+				}
+			})
+		}
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

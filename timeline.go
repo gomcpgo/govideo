@@ -19,7 +19,7 @@ type Canvas struct {
 	Width, Height int         // default 1920x1080
 	FrameRate     Rational    // constant output rate; default 30/1
 	Fit           FitMode     // how sources of other shapes are placed
-	Background    color.Color // padding colour; default black
+	Background    color.Color // shown in the padding and behind transparent stills; default black
 }
 
 // ClipOptions configures a clip added with AddClip.
