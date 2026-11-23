@@ -139,6 +139,52 @@ func corpusVideo(t *testing.T, dir string) {
 				}
 			})
 		}
+		// Interlaced pictures are shown a field at a time. A frame that still
+		// holds two fields has, wherever something moves, rows that differ
+		// more from their neighbours than from the rows two away.
+		t.Run(name+"/fields", func(t *testing.T) {
+			info, err := videoprobe.ProbeFile(context.Background(), in)
+			if err != nil {
+				t.Fatalf("probe: %v", err)
+			}
+			var v *videoprobe.VideoInfo
+			for _, st := range info.Streams {
+				if st.Kind == videoprobe.Video {
+					v = st.Video
+					break
+				}
+			}
+			if v == nil || !v.Interlaced || !govideo.BuildInfo().OSBackend {
+				t.Skip("not an interlaced stream that can be decoded here")
+			}
+			w, h := v.Width, v.Height
+			tl := govideo.NewTimeline(govideo.Canvas{Width: w, Height: h, FrameRate: govideo.R(30, 1)})
+			tl.AddClip(in, govideo.ClipOptions{Trim: govideo.Range(0, 2*time.Second)})
+			out := filepath.Join(tmp, name+".fields.mov")
+			if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+				t.Fatalf("export: %v", err)
+			}
+			defer os.Remove(out)
+			raw := oracle.FFmpegOutput(t, "-i", out, "-pix_fmt", "gray", "-f", "rawvideo", "-")
+			if len(raw) < w*h {
+				t.Fatal("no frames to look at")
+			}
+			for n := 0; (n+1)*w*h <= len(raw); n++ {
+				f := raw[n*w*h : (n+1)*w*h]
+				var next, second float64
+				for y := 0; y+2 < h; y++ {
+					for x := 0; x < w; x++ {
+						a := float64(f[y*w+x])
+						next += math.Abs(a - float64(f[(y+1)*w+x]))
+						second += math.Abs(a - float64(f[(y+2)*w+x]))
+					}
+				}
+				if next > second {
+					t.Fatalf("output frame %d is combed: rows differ from the next by %.2f a sample, from the one after by %.2f",
+						n, next/float64(w*(h-2)), second/float64(w*(h-2)))
+				}
+			}
+		})
 		// A trim that starts inside the file makes the decoder start at the
 		// keyframe before the cut (MP4 sync samples, the Matroska keyframe
 		// index). The pictures must still be the ones the oracle reaches by
