@@ -31,6 +31,23 @@ func NewVideoFrame(w, h int) *VideoFrame {
 	return f
 }
 
+// Reuse returns a w×h frame for a decoder or filter to write a picture into:
+// f itself, resized, when its planes are large enough, else a new frame (f
+// may be nil). The planes are tightly packed and their contents are
+// unspecified; the frame is marked BT.709 limited range. Passing the frame of
+// the previous picture each time keeps a steady stream of pictures of one
+// size from allocating.
+func (f *VideoFrame) Reuse(w, h int) *VideoFrame {
+	cw, ch := (w+1)/2, (h+1)/2
+	if f == nil || cap(f.Y) < w*h || cap(f.Cb) < cw*ch || cap(f.Cr) < cw*ch {
+		f = &VideoFrame{Y: make([]byte, w*h), Cb: make([]byte, cw*ch), Cr: make([]byte, cw*ch)}
+	}
+	f.Width, f.Height, f.YStride, f.CStride = w, h, w, cw
+	f.Y, f.Cb, f.Cr = f.Y[:w*h], f.Cb[:cw*ch], f.Cr[:cw*ch]
+	f.Matrix, f.FullRange = 1, false
+	return f
+}
+
 // ChromaSize returns the dimensions of the chroma planes.
 func (f *VideoFrame) ChromaSize() (w, h int) { return (f.Width + 1) / 2, (f.Height + 1) / 2 }
 

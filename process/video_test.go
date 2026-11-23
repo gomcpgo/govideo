@@ -358,6 +358,23 @@ func TestRotate(t *testing.T) {
 	if r := Rotate(f, 90); r.Y[r.Width-1] != 200 {
 		t.Error("rotate 90 is not clockwise")
 	}
+
+	// RotateInto writes where it is told and gives the same picture; an
+	// angle that is no turn returns the source and leaves the target alone.
+	src := randomFrame(8, 6, 3)
+	src.Matrix, src.FullRange = 6, true
+	into := codec.NewVideoFrame(16, 16)
+	y := &into.Y[0]
+	for _, d := range []int{90, 180, 270, -90} {
+		got := RotateInto(into, src, d)
+		if got != into || &got.Y[0] != y || got.Matrix != 6 || !got.FullRange || !sameFrame(got, Rotate(src, d)) {
+			t.Errorf("RotateInto by %d: reused %v, same picture %v", d, got == into, sameFrame(got, Rotate(src, d)))
+		}
+	}
+	before := *into
+	if RotateInto(into, src, 0) != src || RotateInto(into, src, 30) != src || into.Width != before.Width {
+		t.Error("RotateInto by an angle that is no turn should return the source")
+	}
 }
 
 // jpegWithOrientation encodes a small JPEG and splices in an EXIF APP1
