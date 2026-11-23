@@ -111,6 +111,15 @@ func flipH(f *codec.VideoFrame) *codec.VideoFrame {
 // (negative values and multiples of 360 are normalised). Other angles, and
 // 0, return f unchanged.
 func Rotate(f *codec.VideoFrame, degrees int) *codec.VideoFrame {
+	return RotateInto(nil, f, degrees)
+}
+
+// RotateInto is Rotate writing the result to the planes of into when they
+// are large enough (see codec.VideoFrame.Reuse), so that rotating picture
+// after picture does not allocate; into may be nil but not f. When the
+// angle is no quarter, half or three-quarter turn, f itself is returned and
+// into is left alone.
+func RotateInto(into, f *codec.VideoFrame, degrees int) *codec.VideoFrame {
 	d := ((degrees % 360) + 360) % 360
 	if f == nil || (d != 90 && d != 180 && d != 270) {
 		return f
@@ -119,7 +128,7 @@ func Rotate(f *codec.VideoFrame, degrees int) *codec.VideoFrame {
 	if d != 180 {
 		w, h = h, w
 	}
-	out := codec.NewVideoFrame(w, h)
+	out := into.Reuse(w, h)
 	out.Matrix, out.FullRange = f.Matrix, f.FullRange
 	scw, sch := f.ChromaSize()
 	rotatePlane(out.Y, out.YStride, f.Y, f.YStride, f.Width, f.Height, d)

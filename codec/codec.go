@@ -21,19 +21,39 @@ type VideoEncoder interface {
 	Encode(f *VideoFrame) ([]byte, error)
 }
 
-// TimedFrame is a decoded picture with its presentation time.
-type TimedFrame struct {
-	Frame *VideoFrame
-	PTS   time.Duration
+// Picture is a decoded picture that is still in its decoder's memory. A
+// stream decoder hands out pictures rather than frames so that a picture
+// nobody looks at costs no copy: one decoded only because later pictures
+// refer to it (everything between a sync sample and a cut), or one that a
+// lower output frame rate passes over.
+type Picture interface {
+	// Frame copies the picture into a frame and returns it. The planes of
+	// into are reused when they are large enough (see Reuse), so a caller
+	// that passes back the frame it got last time does not allocate; into
+	// may be nil. The frame returned shares no memory with the decoder.
+	Frame(into *VideoFrame) (*VideoFrame, error)
+	// Release gives the picture back to the decoder. It is called once the
+	// picture is no longer needed, and the picture is not used afterwards.
+	// Closing the decoder releases the pictures still out.
+	Release()
+}
+
+// TimedPicture is a decoded picture with its presentation time.
+type TimedPicture struct {
+	Picture Picture
+	PTS     time.Duration
 }
 
 // VideoStreamDecoder decodes inter-frame video. Packets are sent in decode
-// order; frames come back in decode order too, each tagged with the
-// presentation time of its packet, so the caller reorders them.
+// order; pictures come back in decode order too, each tagged with the
+// presentation time of its packet, so the caller reorders them. The caller
+// releases every picture it is given.
 type VideoStreamDecoder interface {
-	Decode(packet []byte, pts time.Duration) ([]TimedFrame, error)
-	// Flush returns the frames still held by the decoder at end of stream.
-	Flush() ([]TimedFrame, error)
+	// Decode returns the pictures the packet completes. The slice is only
+	// valid until the next call to Decode or Flush.
+	Decode(packet []byte, pts time.Duration) ([]TimedPicture, error)
+	// Flush returns the pictures still held by the decoder at end of stream.
+	Flush() ([]TimedPicture, error)
 	Close() error
 }
 

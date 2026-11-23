@@ -14,6 +14,7 @@ import (
 // objects are carried as uintptr handles: they are never dereferenced in Go.
 var (
 	cfRelease                 func(obj uintptr)
+	cfRetain                  func(obj uintptr) uintptr
 	cfNumberCreate            func(alloc uintptr, typ int, value unsafe.Pointer) uintptr
 	cfDictionaryCreate        func(alloc uintptr, keys, values unsafe.Pointer, n int, keyCB, valueCB uintptr) uintptr
 	cfDictionaryGetValue      func(dict, key uintptr) uintptr
@@ -50,6 +51,7 @@ var (
 	vtDecompressionSessionDecode     func(session, sbuf uintptr, flags uint32, frameRefCon uintptr, info *uint32) int32
 	vtDecompressionSessionWait       func(session uintptr) int32
 	vtDecompressionSessionInvalidate func(session uintptr)
+	vtDecompressionSessionCanAccept  func(session, format uintptr) bool
 	vtCompressionSessionCreate       func(alloc uintptr, width, height int32, codec uint32, spec, attrs, dataAlloc, callback, refCon uintptr, out *uintptr) int32
 	vtCompressionSessionEncode       func(session, image uintptr, pts, dur cmTime, props, frameRefCon uintptr, info *uint32) int32
 	vtCompressionSessionComplete     func(session uintptr, until cmTime) int32
@@ -125,6 +127,7 @@ func load() (err error) {
 	}
 	bind := purego.RegisterLibFunc // panics on a missing symbol
 	bind(&cfRelease, cf, "CFRelease")
+	bind(&cfRetain, cf, "CFRetain")
 	bind(&cfNumberCreate, cf, "CFNumberCreate")
 	bind(&cfDictionaryCreate, cf, "CFDictionaryCreate")
 	bind(&cfDictionaryGetValue, cf, "CFDictionaryGetValue")
@@ -161,6 +164,7 @@ func load() (err error) {
 	bind(&vtDecompressionSessionDecode, vt, "VTDecompressionSessionDecodeFrame")
 	bind(&vtDecompressionSessionWait, vt, "VTDecompressionSessionWaitForAsynchronousFrames")
 	bind(&vtDecompressionSessionInvalidate, vt, "VTDecompressionSessionInvalidate")
+	bind(&vtDecompressionSessionCanAccept, vt, "VTDecompressionSessionCanAcceptFormatDescription")
 	bind(&vtCompressionSessionCreate, vt, "VTCompressionSessionCreate")
 	bind(&vtCompressionSessionEncode, vt, "VTCompressionSessionEncodeFrame")
 	bind(&vtCompressionSessionComplete, vt, "VTCompressionSessionCompleteFrames")

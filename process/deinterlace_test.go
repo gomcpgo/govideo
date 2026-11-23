@@ -66,6 +66,22 @@ func TestBob(t *testing.T) {
 	if Bob(nil, TopField) != nil {
 		t.Error("Bob(nil) is not nil")
 	}
+
+	// BobInto writes where it is told, whatever was there, and gives the
+	// same picture as Bob.
+	src := wovenFrame(16, 12, func(plane, y int) byte { return byte(3*y + 40*plane + 100*(y%2)) })
+	want := Bob(src, BottomField)
+	into := codec.NewVideoFrame(32, 32)
+	into.Matrix = 9
+	y := &into.Y[0]
+	got := BobInto(into, src, BottomField)
+	if got != into || &got.Y[0] != y {
+		t.Error("BobInto did not use the frame it was given")
+	}
+	if got.Width != 16 || got.Height != 12 || got.Matrix != src.Matrix || got.FullRange != src.FullRange ||
+		!bytes.Equal(got.Y, want.Y) || !bytes.Equal(got.Cb, want.Cb) || !bytes.Equal(got.Cr, want.Cr) {
+		t.Error("BobInto and Bob disagree")
+	}
 }
 
 // TestBobInterpolation checks the rows that are filled in: exact on a

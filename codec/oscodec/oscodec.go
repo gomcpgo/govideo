@@ -6,7 +6,10 @@
 // The bindings use purego; there is no cgo.
 package oscodec
 
-import "errors"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // ErrUnsupported reports that this platform has no operating-system codec
 // backend, or that the backend lacks the requested codec.
@@ -28,6 +31,32 @@ type VideoConfig struct {
 	// or container (1 = BT.709, 5 or 6 = BT.601, 9 = BT.2020). 0 leaves it
 	// to the decoder, which may not know either.
 	Matrix int
+}
+
+// Restarter is a video decoder that can go on to decode another stream
+// without being closed and opened again, which spares setting up a decoder
+// session for every clip of a timeline. The decoders NewVideoDecoder returns
+// implement it where the platform has a backend.
+type Restarter interface {
+	// Restart makes the decoder ready for the stream c describes, as a newly
+	// opened decoder would be, and reports whether it could. The pictures of
+	// the stream before are released. On false the decoder is as it was.
+	Restart(c VideoConfig) bool
+}
+
+// DecoderStats counts what the video decoders of this process have done. It
+// is for tests and diagnostics.
+type DecoderStats struct {
+	Sessions int64 // decoder sessions opened
+	Reused   int64 // streams decoded on the session of an earlier stream
+	Pictures int64 // decoded pictures handed out and not yet released
+}
+
+var stats struct{ sessions, reused, pictures atomic.Int64 }
+
+// VideoDecoderStats returns the counts so far.
+func VideoDecoderStats() DecoderStats {
+	return DecoderStats{Sessions: stats.sessions.Load(), Reused: stats.reused.Load(), Pictures: stats.pictures.Load()}
 }
 
 // EncodeConfig describes an H.264 encode.

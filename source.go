@@ -495,15 +495,19 @@ func (a *audioStream) read(dst []float32) (int, error) {
 // before it; H.264 and HEVC bound reordering to 16 frames.
 const reorderWindow = 17
 
-// vframe is a source picture, decoded (frame) or not yet (data).
+// vframe is a source picture: of an intra-only codec, a packet (data) that
+// is decoded when the picture is shown (frame); of an inter-frame codec, a
+// picture still in the decoder (pic), copied out when it is shown.
 type vframe struct {
 	pts   time.Duration
 	data  []byte
 	frame *codec.VideoFrame
+	pic   codec.Picture
 	// order says whether the frame is a pair of fields. Such a frame is
 	// delivered as two vframes, one per field (bob), which share the decoded
-	// frame: twin is the second field's, for the first to pass a lazily
-	// decoded frame on to.
+	// picture: twin is the second field's, for the first to pass a lazily
+	// decoded frame on to. The second field is the later of the two, so it
+	// is the one that gives the picture back to the decoder.
 	order codechdr.FieldOrder
 	bob   bool
 	field process.Field
@@ -520,17 +524,29 @@ type vframe struct {
 // chosen by time like any other picture, so an output at the field rate
 // shows every field and one at the frame rate shows one field of each
 // frame.
+//
+// The decoder of an inter-frame codec is taken from the export's decoders
+// when the first frame is asked for and given back by close, so that a
+// timeline of many clips has one decoder at work, not one per clip. Its
+// pictures stay in the decoder until one is shown: most of what is decoded
+// ahead of a cut, and every frame a lower output rate passes over, is
+// never copied.
 type videoStream struct {
 	rd       packetReader
 	intra    codec.VideoDecoder       // intra-only codecs
-	dec      codec.VideoStreamDecoder // inter-frame codecs
+	dec      codec.VideoStreamDecoder // inter-frame codecs; nil until needed
+	decs     *videoDecoders           // where dec comes from and goes back to
+	cfg      oscodec.VideoConfig      // what dec is opened for
+	name     string                   // the file, for error messages
+	broken   bool                     // dec has failed on a packet
+	closed   bool
 	rotation int
 	mirror   bool          // flip left to right after rotating
 	start    time.Duration // first time that will be asked for
 	slack    time.Duration // how far past the asked time a frame may start
 
-	look    []packet           // read but not yet decoded
-	held    []codec.TimedFrame // decoded, waiting for their turn
+	look    []packet             // read but not yet decoded
+	held    []codec.TimedPicture // decoded, waiting for their turn
 	flushed bool
 	eof     bool
 
@@ -561,12 +577,103 @@ type videoStream struct {
 	seq       int64
 	shown     *codec.VideoFrame
 	shownSeq  int64
+
+	// The frames a shown picture is written to on its way out: as copied
+	// from the decoder (raw, holding the picture rawPic), deinterlaced and
+	// rotated. Each is reused for the next picture, so a stream does not
+	// allocate once it is running.
+	raw, bobbed, turned *codec.VideoFrame
+	rawPic              codec.Picture
+}
+
+// maxIdleDecoders is how many decoders of finished clips an export keeps
+// for later clips: enough for a timeline that goes round four kinds of
+// source which cannot share one. An idle session costs little memory in
+// this process (its picture buffers are let go within seconds), but the
+// system has only so many hardware decoders to lend.
+const maxIdleDecoders = 4
+
+// videoDecoders hands out the video decoders of one export and takes them
+// back, so that a clip can continue on the decoder of an earlier clip of
+// the same format instead of setting up its own (SPEC §6). It also passes
+// on the frames a finished stream copied its pictures into.
+type videoDecoders struct {
+	idle    []codec.VideoStreamDecoder // least recently used first
+	frames  []*codec.VideoFrame
+	checked map[string]bool // formats check has found a decoder for
+}
+
+// check reports whether the stream cfg describes can be decoded here, by
+// getting a decoder for it, which is then kept for the clip. A format is
+// tried once however many clips have it.
+func (c *videoDecoders) check(cfg oscodec.VideoConfig) error {
+	key := fmt.Sprintf("%s %dx%d %s", cfg.Codec, cfg.Width, cfg.Height, cfg.Record)
+	if c.checked[key] {
+		return nil
+	}
+	d, err := c.open(cfg)
+	if err != nil {
+		return err
+	}
+	c.put(d)
+	if c.checked == nil {
+		c.checked = map[string]bool{}
+	}
+	c.checked[key] = true
+	return nil
+}
+
+// open returns a decoder for the stream cfg describes: an idle one that can
+// take the stream over, else a new one.
+func (c *videoDecoders) open(cfg oscodec.VideoConfig) (codec.VideoStreamDecoder, error) {
+	for i := len(c.idle) - 1; i >= 0; i-- {
+		d := c.idle[i]
+		if r, ok := d.(oscodec.Restarter); ok && r.Restart(cfg) {
+			c.idle = append(c.idle[:i], c.idle[i+1:]...)
+			return d, nil
+		}
+	}
+	return oscodec.NewVideoDecoder(cfg)
+}
+
+// put takes back a decoder that is in good order and whose pictures have
+// all been released.
+func (c *videoDecoders) put(d codec.VideoStreamDecoder) {
+	if _, ok := d.(oscodec.Restarter); !ok {
+		d.Close()
+		return
+	}
+	c.idle = append(c.idle, d)
+	if len(c.idle) > maxIdleDecoders {
+		c.idle[0].Close()
+		c.idle = append(c.idle[:0], c.idle[1:]...)
+	}
+}
+
+// frame returns a frame to reuse, or nil.
+func (c *videoDecoders) frame() *codec.VideoFrame {
+	n := len(c.frames)
+	if n == 0 {
+		return nil
+	}
+	f := c.frames[n-1]
+	c.frames = c.frames[:n-1]
+	return f
+}
+
+func (c *videoDecoders) close() {
+	for _, d := range c.idle {
+		d.Close()
+	}
+	c.idle, c.frames = nil, nil
 }
 
 // openVideo starts reading stream s of m; the first frame asked for will be
 // the one shown at start. slack is the tolerance of frame selection (see
-// frameAt).
-func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack time.Duration, deint DeinterlaceMode) (*videoStream, error) {
+// frameAt). A stream that needs a system decoder is checked against one
+// here, so that a clip that cannot be decoded fails before anything is
+// rendered, but holds none until its first frame is asked for.
+func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack time.Duration, deint DeinterlaceMode, decs *videoDecoders) (*videoStream, error) {
 	ci, err := Available(CodecID(s.Codec), Decode)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
@@ -575,7 +682,8 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	if err != nil {
 		return nil, err
 	}
-	v := &videoStream{rd: rd, rotation: s.Video.Rotation, mirror: s.Video.Mirrored, start: start, slack: slack, shownSeq: -1}
+	v := &videoStream{rd: rd, decs: decs, name: m.path,
+		rotation: s.Video.Rotation, mirror: s.Video.Mirrored, start: start, slack: slack, shownSeq: -1}
 	if r := s.Video.FrameRate.Float(); r > 0 {
 		v.frameDur = time.Duration(1e9 / r)
 	}
@@ -605,9 +713,8 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	// The matrix comes from the stream's own signalling; the system decoder
 	// does not always pass it on with the pictures.
 	matrix := map[string]int{"bt709": 1, "bt470bg": 5, "smpte170m": 6, "smpte240m": 7, "bt2020nc": 9, "bt2020c": 10}[s.Video.ColorMatrix]
-	v.dec, err = oscodec.NewVideoDecoder(oscodec.VideoConfig{Codec: string(ci.ID), Width: w, Height: h,
-		Record: m.config(s, box), Matrix: matrix})
-	if err != nil {
+	v.cfg = oscodec.VideoConfig{Codec: string(ci.ID), Width: w, Height: h, Record: m.config(s, box), Matrix: matrix}
+	if err := decs.check(v.cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
 	if sk, ok := rd.(syncSeeker); ok && start > 0 {
@@ -617,10 +724,68 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	return v, nil
 }
 
+// close ends the stream: its pictures go back to the decoder, and the
+// decoder and the frames go back to the export for the next clip. The frame
+// frameAt returned last is no longer valid.
 func (v *videoStream) close() {
-	if v.dec != nil {
-		v.dec.Close()
+	if v.closed {
+		return
 	}
+	v.closed = true
+	for _, f := range []*vframe{v.cur, v.peek, v.second, v.ahead} {
+		v.drop(f)
+	}
+	for _, f := range v.held {
+		f.Picture.Release()
+	}
+	v.cur, v.peek, v.second, v.ahead, v.held, v.look = nil, nil, nil, nil, nil, nil
+	v.shown, v.rawPic = nil, nil
+	if v.dec != nil {
+		if v.broken {
+			v.dec.Close() // not one to hand to the next clip
+		} else {
+			v.decs.put(v.dec)
+		}
+		v.dec = nil
+	}
+	for _, f := range []*codec.VideoFrame{v.raw, v.bobbed, v.turned} {
+		if f != nil {
+			v.decs.frames = append(v.decs.frames, f)
+		}
+	}
+	v.raw, v.bobbed, v.turned = nil, nil, nil
+}
+
+// drop gives the picture of a frame that will not be shown again back to
+// the decoder. The first field of a frame leaves that to the second.
+func (v *videoStream) drop(f *vframe) {
+	if f != nil && f.pic != nil && f.twin == nil {
+		f.pic.Release()
+		f.pic = nil
+	}
+}
+
+// decode passes a packet, or with flush the end of the stream, to the
+// decoder, which is taken from the export's decoders on first use.
+func (v *videoStream) decode(p packet, flush bool) ([]codec.TimedPicture, error) {
+	if v.closed {
+		return nil, errors.New("govideo: video stream is closed")
+	}
+	if v.dec == nil {
+		dec, err := v.decs.open(v.cfg)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", v.name, err)
+		}
+		v.dec = dec
+	}
+	if flush {
+		return v.dec.Flush()
+	}
+	out, err := v.dec.Decode(p.data, p.pts)
+	if err != nil {
+		v.broken = true
+	}
+	return out, err
 }
 
 func (v *videoStream) pull() (*packet, error) {
@@ -749,11 +914,11 @@ func (v *videoStream) nextFrame() (*vframe, error) {
 			if ready {
 				f := v.held[first]
 				v.held = append(v.held[:first], v.held[first+1:]...)
-				return &vframe{pts: f.PTS, frame: f.Frame, order: v.fieldOrder(f.PTS)}, nil
+				return &vframe{pts: f.PTS, pic: f.Picture, order: v.fieldOrder(f.PTS)}, nil
 			}
 		}
 		var (
-			frames []codec.TimedFrame
+			frames []codec.TimedPicture
 			err    error
 		)
 		switch {
@@ -767,22 +932,22 @@ func (v *videoStream) nextFrame() (*vframe, error) {
 					v.orders[p.pts] = o
 				}
 			}
-			frames, err = v.dec.Decode(p.data, p.pts)
+			frames, err = v.decode(p, false)
 			if err != nil && p.pts < v.start {
 				// Pictures before the start are only decoded as references:
 				// one that cannot be decoded is not needed for itself.
 				err = nil
 			}
 		case !v.flushed:
-			frames, err = v.dec.Flush()
+			frames, err = v.decode(packet{}, true)
 			v.flushed = true
 		default:
 			return nil, nil
 		}
+		v.held = append(v.held, frames...) // even with an error: they are released on close
 		if err != nil {
 			return nil, err
 		}
-		v.held = append(v.held, frames...)
 	}
 }
 
@@ -795,6 +960,9 @@ func (v *videoStream) nextFrame() (*vframe, error) {
 // screen for most of the output frame, and the choice is stable against
 // timestamp rounding (Matroska stores whole milliseconds) and against
 // sources whose frames sit at a constant offset from the output grid.
+//
+// The frame belongs to the stream, which writes the next picture over it:
+// it is valid until the sequence number changes or the stream is closed.
 func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error) {
 	eps := max(v.slack, 50*time.Microsecond)
 	var err error
@@ -816,24 +984,52 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 		if v.peek == nil || v.peek.pts > t+eps {
 			break
 		}
+		v.drop(v.cur)
 		v.cur, v.peek = v.peek, nil
 		v.seq++
 	}
 	if v.shownSeq != v.seq {
-		f := v.cur.frame
-		if f == nil {
-			if f, err = v.intra.Decode(v.cur.data); err != nil {
+		c := v.cur
+		f := c.frame
+		switch {
+		case c.pic != nil:
+			// The two fields of a frame are shown from one copy of it.
+			if c.pic != v.rawPic {
+				if v.raw == nil {
+					v.raw = v.decs.frame()
+				}
+				v.rawPic = nil
+				if v.raw, err = c.pic.Frame(v.raw); err != nil {
+					return nil, 0, err
+				}
+				v.rawPic = c.pic
+			}
+			f = v.raw
+		case f == nil:
+			if f, err = v.intra.Decode(c.data); err != nil {
 				return nil, 0, err
 			}
-			if v.cur.twin != nil {
-				v.cur.twin.frame = f
+			if c.twin != nil {
+				c.twin.frame = f
 			}
 		}
-		if v.cur.bob {
-			f = process.Bob(f, v.cur.field)
+		if c.bob {
+			if v.bobbed == nil {
+				v.bobbed = v.decs.frame()
+			}
+			v.bobbed = process.BobInto(v.bobbed, f, c.field)
+			f = v.bobbed
 		}
-		f = process.Rotate(f, v.rotation)
+		if v.turned == nil && v.rotation%360 != 0 {
+			v.turned = v.decs.frame()
+		}
+		if r := process.RotateInto(v.turned, f, v.rotation); r != f {
+			v.turned, f = r, r
+		}
 		if v.mirror {
+			if f == v.raw {
+				v.rawPic = nil // no longer the picture as it was decoded
+			}
 			f = process.FlipH(f) // the frame is this stream's own
 		}
 		v.shown, v.shownSeq = f, v.seq

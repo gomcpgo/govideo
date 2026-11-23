@@ -3,9 +3,11 @@ package govideo
 import (
 	"context"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
+	"github.com/gomcpgo/govideo/codec/oscodec"
 	"github.com/gomcpgo/govideo/internal/oracle"
 	"github.com/gomcpgo/govideo/videoprobe"
 )
@@ -58,5 +60,67 @@ func TestSeekSync(t *testing.T) {
 	}
 	if a, b := got["gop.mp4"], got["gop.mkv"]; a != 0 && b != 0 && (a-b > time.Millisecond || b-a > time.Millisecond) {
 		t.Errorf("MP4 seeks to %v, Matroska to %v", a, b)
+	}
+}
+
+// TestVideoStreamSteadyState checks that showing frame after frame of an
+// inter-frame stream allocates nothing of the size of a picture: decoded
+// pictures stay in the decoder and are copied into frames the stream reuses.
+func TestVideoStreamSteadyState(t *testing.T) {
+	if !BuildInfo().OSBackend {
+		t.Skip("no operating-system codec backend on this platform")
+	}
+	const w, h, fps, count = 1280, 720, 30, 60
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "card.mp4")
+	tl := NewTimeline(Canvas{Width: w, Height: h, FrameRate: R(fps, 1)})
+	tl.AddGenerated(count*time.Second/fps, GenerateOptions{Pattern: PatternTestCard})
+	if err := tl.Export(ctx, path, ExportOptions{Profile: ProfileCompatible}); err != nil {
+		t.Fatal(err)
+	}
+	m, err := openMedia(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.close()
+	decs := &videoDecoders{}
+	defer decs.close()
+	before := oscodec.VideoDecoderStats().Pictures
+	v, err := openVideo(ctx, m, m.stream(videoprobe.Video), 0, 0, DeinterlaceAuto, decs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer v.close()
+	show := func(from, to int) {
+		for n := from; n < to; n++ {
+			f, seq, err := v.frameAt(time.Duration(n) * time.Second / fps)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if seq != int64(n)+1 || f.Width != w || f.Height != h {
+				t.Fatalf("frame %d: sequence %d, %dx%d", n, seq, f.Width, f.Height)
+			}
+		}
+	}
+	show(0, 20) // the look-ahead fills and the frames are allocated
+	var m0, m1 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	show(20, count)
+	runtime.ReadMemStats(&m1)
+	perFrame := (m1.TotalAlloc - m0.TotalAlloc) / (count - 20)
+	t.Logf("%d bytes allocated per frame shown; a frame is %d bytes", perFrame, w*h*3/2)
+	if perFrame > w*h*3/2/8 {
+		t.Errorf("%d bytes allocated per frame shown: pictures are not being reused", perFrame)
+	}
+	// The decoder holds no more pictures than the stream is looking at.
+	if out := oscodec.VideoDecoderStats().Pictures - before; out > 4 {
+		t.Errorf("%d pictures held at the end of the stream", out)
+	}
+	v.close()
+	if out := oscodec.VideoDecoderStats().Pictures - before; out != 0 {
+		t.Errorf("%d pictures not released by close", out)
+	}
+	if len(decs.idle) != 1 || len(decs.frames) != 1 {
+		t.Errorf("close left %d decoders and %d frames for the next clip, want 1 and 1", len(decs.idle), len(decs.frames))
 	}
 }

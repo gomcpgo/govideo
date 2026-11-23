@@ -151,6 +151,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 	var opened []*media
 	var segs []*segment
 	var overlays []*overlay
+	decs := &videoDecoders{}
 	defer func() {
 		for _, sg := range segs {
 			if sg.video != nil {
@@ -163,6 +164,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		for _, ov := range overlays {
 			ov.as.close()
 		}
+		decs.close()
 		for _, m := range opened {
 			m.close()
 		}
@@ -246,7 +248,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 			}
 			sg.trim, dur = start, end-start
 			if vs != nil {
-				if sg.video, err = openVideo(ctx, m, vs, sg.origin+start, slack, it.clip.Deinterlace); err != nil {
+				if sg.video, err = openVideo(ctx, m, vs, sg.origin+start, slack, it.clip.Deinterlace, decs); err != nil {
 					return err
 				}
 			} else {
@@ -486,6 +488,10 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 				o.Progress(Progress{Frame: frame, TotalFrames: totalFrames,
 					Time: time.Duration(float64(frame) / fps.Float() * 1e9), Duration: total})
 			}
+		}
+		// The clip is done: its decoder goes on to the next clip.
+		if sg.video != nil {
+			sg.video.close()
 		}
 	}
 

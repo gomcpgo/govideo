@@ -23,6 +23,36 @@ func gradientFrame(w, h, n int) *codec.VideoFrame {
 	return f
 }
 
+// timedFrame is a decoded picture copied out of the decoder.
+type timedFrame struct {
+	Frame *codec.VideoFrame
+	PTS   time.Duration
+}
+
+// frames copies pictures out of the decoder and releases them.
+func frames(t *testing.T, pics []codec.TimedPicture) (out []timedFrame) {
+	t.Helper()
+	for _, p := range pics {
+		f, err := p.Picture.Frame(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Picture.Release()
+		out = append(out, timedFrame{f, p.PTS})
+	}
+	return out
+}
+
+// lumaPSNR returns the PSNR of a frame's luma plane against want's.
+func lumaPSNR(f, want *codec.VideoFrame) float64 {
+	var sum float64
+	for j := range want.Y {
+		d := float64(want.Y[j]) - float64(f.Y[j])
+		sum += d * d
+	}
+	return 10 * math.Log10(255*255/(sum/float64(len(want.Y))+1e-9))
+}
+
 // TestH264RoundTrip encodes frames with VideoToolbox and decodes them again,
 // without any container in between.
 func TestH264RoundTrip(t *testing.T) {
@@ -73,36 +103,30 @@ func TestH264RoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	var frames []codec.TimedFrame
+	var decoded []timedFrame
 	for i, p := range packets {
 		got, err := dec.Decode(p.Data, time.Duration(i)*time.Second/30)
 		if err != nil {
 			t.Fatalf("decode packet %d: %v", i, err)
 		}
-		frames = append(frames, got...)
+		decoded = append(decoded, frames(t, got)...)
 	}
 	rest, err := dec.Flush()
 	if err != nil {
 		t.Fatal(err)
 	}
-	frames = append(frames, rest...)
-	if len(frames) != count {
-		t.Fatalf("decoded %d frames, want %d", len(frames), count)
+	decoded = append(decoded, frames(t, rest)...)
+	if len(decoded) != count {
+		t.Fatalf("decoded %d frames, want %d", len(decoded), count)
 	}
-	for i, f := range frames {
+	for i, f := range decoded {
 		if f.PTS != time.Duration(i)*time.Second/30 {
 			t.Fatalf("frame %d has PTS %v", i, f.PTS)
 		}
 		if f.Frame.Width != w || f.Frame.Height != h || f.Frame.Matrix != 1 || f.Frame.FullRange {
 			t.Fatalf("frame %d: %dx%d matrix %d full %v", i, f.Frame.Width, f.Frame.Height, f.Frame.Matrix, f.Frame.FullRange)
 		}
-		want := gradientFrame(w, h, i)
-		var sum float64
-		for j := range want.Y {
-			d := float64(want.Y[j]) - float64(f.Frame.Y[j])
-			sum += d * d
-		}
-		if psnr := 10 * math.Log10(255*255/(sum/float64(len(want.Y))+1e-9)); psnr < 32 {
+		if psnr := lumaPSNR(f.Frame, gradientFrame(w, h, i)); psnr < 32 {
 			t.Errorf("frame %d: luma PSNR %.1f dB", i, psnr)
 		}
 	}
@@ -274,29 +298,24 @@ func TestH264Reorder(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dec.Close()
-	var frames []codec.TimedFrame
+	var decoded []timedFrame
 	for i, p := range packets {
 		got, err := dec.Decode(p.Data, time.Duration(p.Index)*time.Second/30)
 		if err != nil {
 			t.Fatalf("decode packet %d: %v", i, err)
 		}
-		frames = append(frames, got...)
+		decoded = append(decoded, frames(t, got)...)
 	}
 	rest, err := dec.Flush()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if frames = append(frames, rest...); len(frames) != count {
-		t.Fatalf("decoded %d frames, want %d", len(frames), count)
+	if decoded = append(decoded, frames(t, rest)...); len(decoded) != count {
+		t.Fatalf("decoded %d frames, want %d", len(decoded), count)
 	}
-	for _, f := range frames {
+	for _, f := range decoded {
 		want := gradientFrame(w, h, int((f.PTS*30+time.Second/2)/time.Second))
-		var sum float64
-		for j := range want.Y {
-			d := float64(want.Y[j]) - float64(f.Frame.Y[j])
-			sum += d * d
-		}
-		if psnr := 10 * math.Log10(255*255/(sum/float64(len(want.Y))+1e-9)); psnr < 32 {
+		if psnr := lumaPSNR(f.Frame, want); psnr < 32 {
 			t.Errorf("frame at %v: luma PSNR %.1f dB", f.PTS, psnr)
 		}
 	}
@@ -339,5 +358,267 @@ func TestH264Quality(t *testing.T) {
 	}
 	if _, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Quality: 1.5}); err == nil {
 		t.Error("quality 1.5 was accepted")
+	}
+}
+
+// encodeGradient encodes count frames of the moving gradient, the first
+// numbered from, with a keyframe every key frames.
+func encodeGradient(t *testing.T, w, h, from, count, key int) (packets []codec.EncodedFrame, config []byte) {
+	t.Helper()
+	enc, err := NewH264Encoder(EncodeConfig{Width: w, Height: h, FrameNum: 30, FrameDen: 1, Bitrate: 2_000_000, KeyInterval: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	for n := 0; n <= count; n++ {
+		var out []codec.EncodedFrame
+		if n < count {
+			out, err = enc.Encode(gradientFrame(w, h, from+n))
+		} else {
+			out, err = enc.Flush()
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		packets = append(packets, out...)
+	}
+	if len(packets) != count {
+		t.Fatalf("%d packets for %d frames", len(packets), count)
+	}
+	return packets, enc.Config()
+}
+
+// TestPictures covers the life of decoded pictures: they are copied out only
+// on request, into the frame offered; they are counted until released; and
+// closing the decoder releases the ones still out.
+func TestPictures(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	const w, h, count = 320, 240, 12
+	packets, cfg := encodeGradient(t, w, h, 0, count, 30)
+	dec, err := NewVideoDecoder(VideoConfig{Codec: "h264", Width: w, Height: h, Record: cfg, Matrix: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	before := VideoDecoderStats().Pictures
+	var pics []codec.TimedPicture
+	for i, p := range packets {
+		got, err := dec.Decode(p.Data, time.Duration(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		pics = append(pics, got...) // the slice itself is the decoder's
+	}
+	if len(pics) != count {
+		t.Fatalf("%d pictures, want %d", len(pics), count)
+	}
+	if out := VideoDecoderStats().Pictures - before; out != count {
+		t.Errorf("%d pictures counted as out, want %d", out, count)
+	}
+
+	// Read out of order and into one frame: each copy is the right picture
+	// and lands in the same memory.
+	var frame *codec.VideoFrame
+	var first *byte
+	for _, i := range []int{7, 2, 11, 0} {
+		if frame, err = pics[i].Picture.Frame(frame); err != nil {
+			t.Fatal(err)
+		}
+		if first == nil {
+			first = &frame.Y[0]
+		} else if first != &frame.Y[0] {
+			t.Error("the frame offered was not reused")
+		}
+		if psnr := lumaPSNR(frame, gradientFrame(w, h, i)); psnr < 32 {
+			t.Errorf("picture %d: luma PSNR %.1f dB", i, psnr)
+		}
+	}
+	// A frame of another size is replaced, not written past.
+	small := codec.NewVideoFrame(16, 16)
+	if f, err := pics[3].Picture.Frame(small); err != nil || f.Width != w || f.Height != h || len(f.Y) != w*h {
+		t.Errorf("copy into a small frame: %v, %dx%d", err, f.Width, f.Height)
+	}
+	allocs := testing.AllocsPerRun(20, func() {
+		if frame, err = pics[5].Picture.Frame(frame); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if size := float64(w * h * 3 / 2); allocs*16 > size/64 { // the binding allocates a few words per call
+		t.Errorf("copying a picture into a frame of its size makes %.0f allocations", allocs)
+	}
+
+	pics[0].Picture.Release()
+	pics[0].Picture.Release() // releasing twice is harmless
+	if _, err := pics[0].Picture.Frame(nil); err == nil {
+		t.Error("a released picture could still be read")
+	}
+	if out := VideoDecoderStats().Pictures - before; out != count-1 {
+		t.Errorf("%d pictures out after one release, want %d", out, count-1)
+	}
+	dec.Close()
+	if out := VideoDecoderStats().Pictures - before; out != 0 {
+		t.Errorf("%d pictures still out after Close", out)
+	}
+	if _, err := pics[1].Picture.Frame(nil); err == nil {
+		t.Error("a picture could be read after its decoder was closed")
+	}
+}
+
+// TestRestart moves a decoder from one stream to another. The session is
+// kept when the new stream starts on an IDR picture, and replaced, without
+// the caller noticing, when it starts anywhere else.
+func TestRestart(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	const w, h, count = 320, 240, 20
+	a, cfgA := encodeGradient(t, w, h, 0, count, 10)
+	b, cfgB := encodeGradient(t, w, h, 100, count, 10)
+	big, cfgBig := encodeGradient(t, 640, 480, 0, 4, 10)
+	conf := func(rec []byte, w, h int) VideoConfig {
+		return VideoConfig{Codec: "h264", Width: w, Height: h, Record: rec, Matrix: 1}
+	}
+	dec, err := NewVideoDecoder(conf(cfgA, w, h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	r, ok := dec.(Restarter)
+	if !ok {
+		t.Fatal("the decoder cannot be restarted")
+	}
+	// run decodes packets from index from on and checks the pictures, which
+	// are numbered base+index.
+	run := func(what string, packets []codec.EncodedFrame, from, base, w, h int) {
+		t.Helper()
+		n := 0
+		for i := from; i <= len(packets); i++ {
+			var got []codec.TimedPicture
+			if i < len(packets) {
+				got, err = dec.Decode(packets[i].Data, time.Duration(i))
+			} else {
+				got, err = dec.Flush()
+			}
+			if err != nil {
+				t.Fatalf("%s: packet %d: %v", what, i, err)
+			}
+			for _, f := range frames(t, got) {
+				if psnr := lumaPSNR(f.Frame, gradientFrame(w, h, base+int(f.PTS))); psnr < 32 {
+					t.Errorf("%s: picture %d: luma PSNR %.1f dB", what, f.PTS, psnr)
+				}
+				n++
+			}
+		}
+		if n != len(packets)-from {
+			t.Errorf("%s: %d pictures, want %d", what, n, len(packets)-from)
+		}
+	}
+	delta := func(s0 DecoderStats) (sessions, reused int64) {
+		s := VideoDecoderStats()
+		return s.Sessions - s0.Sessions, s.Reused - s0.Reused
+	}
+
+	s0 := VideoDecoderStats()
+	run("first stream", a, 0, 0, w, h)
+	// Another stream of the same size, entered at its first IDR picture,
+	// then the first stream again from its second: one session throughout.
+	if !r.Restart(conf(cfgB, w, h)) {
+		t.Fatal("the decoder refused a second stream of the same kind")
+	}
+	run("second stream", b, 0, 100, w, h)
+	if !r.Restart(conf(cfgA, w, h)) {
+		t.Fatal("the decoder refused the first stream again")
+	}
+	if !a[10].Sync {
+		t.Fatal("packet 10 is not a keyframe")
+	}
+	run("first stream again", a, 10, 0, w, h)
+	if sessions, reused := delta(s0); sessions != 0 || reused != 2 {
+		t.Errorf("%d new sessions and %d reuses for two restarts on IDR pictures, want 0 and 2", sessions, reused)
+	}
+
+	// Entered between keyframes the stream cannot be decoded properly, but
+	// the session must not be the one that holds the other stream's
+	// pictures: a new one is opened.
+	s0 = VideoDecoderStats()
+	if !r.Restart(conf(cfgB, w, h)) {
+		t.Fatal("the decoder refused a restart")
+	}
+	got, _ := dec.Decode(b[3].Data, 0)
+	frames(t, got)
+	if sessions, reused := delta(s0); sessions != 1 || reused != 0 {
+		t.Errorf("%d new sessions and %d reuses for a restart between keyframes, want 1 and 0", sessions, reused)
+	}
+	// That may have failed, and a decoder that has failed is not reused.
+	if _, err := dec.Decode([]byte{0, 0, 0, 3, 0x65, 0xff, 0xff}, 0); err != nil {
+		if r.Restart(conf(cfgA, w, h)) {
+			t.Error("a decoder that had failed accepted another stream")
+		}
+		dec.Close()
+		if dec, err = NewVideoDecoder(conf(cfgA, w, h)); err != nil {
+			t.Fatal(err)
+		}
+		defer dec.Close()
+		r = dec.(Restarter)
+		run("after a failure", a, 0, 0, w, h)
+	}
+
+	// Another codec is refused. Another picture size is for the system to
+	// accept or not; whichever it says, the pictures must be right.
+	if r.Restart(VideoConfig{Codec: "hevc", Width: w, Height: h, Record: cfgA}) {
+		t.Error("an H.264 decoder accepted an HEVC stream")
+	}
+	if r.Restart(conf(cfgBig, 640, 480)) {
+		t.Log("the session accepts a stream of another picture size")
+		run("larger stream", big, 0, 0, 640, 480)
+	} else {
+		t.Log("the session does not accept a stream of another picture size")
+		run("first stream, after a refusal", a, 0, 0, w, h)
+	}
+	dec.Close()
+	if r.Restart(conf(cfgA, w, h)) {
+		t.Error("a closed decoder accepted a stream")
+	}
+}
+
+func TestCleanStart(t *testing.T) {
+	nal := func(lenSize int, units ...[]byte) (s []byte) {
+		for _, u := range units {
+			for i := lenSize - 1; i >= 0; i-- {
+				s = append(s, byte(len(u)>>(8*i)))
+			}
+			s = append(s, u...)
+		}
+		return s
+	}
+	sei, idr, slice := []byte{0x06, 1, 2}, []byte{0x65, 0x88}, []byte{0x41, 0x9a}
+	hevc := func(typ byte) []byte { return []byte{typ << 1, 1, 0xaf} }
+	for _, c := range []struct {
+		name    string
+		codec   string
+		lenSize int
+		sample  []byte
+		want    bool
+	}{
+		{"H.264 IDR", "h264", 4, nal(4, idr), true},
+		{"H.264 IDR after SEI", "h264", 4, nal(4, sei, idr), true},
+		{"H.264 IDR, 2-byte lengths", "h264", 2, nal(2, sei, idr), true},
+		{"H.264 non-IDR", "h264", 4, nal(4, sei, slice, slice), false},
+		{"H.264 recovery point only", "h264", 4, nal(4, []byte{0x06, 6, 1, 0x80}, slice), false},
+		{"HEVC IDR_W_RADL", "hevc", 4, nal(4, hevc(39), hevc(19)), true},
+		{"HEVC IDR_N_LP", "hevc", 4, nal(4, hevc(20)), true},
+		{"HEVC BLA", "hevc", 4, nal(4, hevc(16)), true},
+		{"HEVC CRA", "hevc", 4, nal(4, hevc(21)), false},
+		{"HEVC trailing", "hevc", 4, nal(4, hevc(1)), false},
+		{"unknown length size", "h264", 0, nal(4, idr), false},
+		{"length past the end", "h264", 4, []byte{0, 0, 1, 0, 0x65, 0x88}, false},
+		{"empty", "h264", 4, nil, false},
+		{"other codec", "vp9", 4, nal(4, idr), false},
+	} {
+		if got := cleanStart(c.codec, c.lenSize, c.sample); got != c.want {
+			t.Errorf("%s: cleanStart = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

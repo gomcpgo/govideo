@@ -24,16 +24,18 @@ const (
 // The chroma planes are treated the same way: in interlaced 4:2:0 each
 // field has its own chroma rows, and they sit where a progressive frame's
 // would. f is not modified.
-func Bob(f *codec.VideoFrame, field Field) *codec.VideoFrame {
+func Bob(f *codec.VideoFrame, field Field) *codec.VideoFrame { return BobInto(nil, f, field) }
+
+// BobInto is Bob writing the result to the planes of into when they are
+// large enough (see codec.VideoFrame.Reuse), so that deinterlacing frame
+// after frame does not allocate; into may be nil but not f.
+func BobInto(into, f *codec.VideoFrame, field Field) *codec.VideoFrame {
 	if f == nil {
 		return nil
 	}
 	cw, ch := f.ChromaSize()
-	out := &codec.VideoFrame{
-		Width: f.Width, Height: f.Height,
-		Y: make([]byte, f.Width*f.Height), Cb: make([]byte, cw*ch), Cr: make([]byte, cw*ch),
-		YStride: f.Width, CStride: cw, Matrix: f.Matrix, FullRange: f.FullRange,
-	}
+	out := into.Reuse(f.Width, f.Height)
+	out.Matrix, out.FullRange = f.Matrix, f.FullRange
 	bobPlane(out.Y, out.YStride, f.Y, f.YStride, f.Width, f.Height, int(field))
 	bobPlane(out.Cb, out.CStride, f.Cb, f.CStride, cw, ch, int(field))
 	bobPlane(out.Cr, out.CStride, f.Cr, f.CStride, cw, ch, int(field))

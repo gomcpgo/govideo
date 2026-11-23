@@ -102,3 +102,43 @@ func TestFieldMidRow(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitPairs(t *testing.T) {
+	// Every length around the 8-pair step, with guard bytes that must stay.
+	for n := 0; n <= 40; n++ {
+		src := make([]byte, 2*n+3)
+		for i := range src {
+			src[i] = byte(7*i + 1)
+		}
+		a, b := make([]byte, n+1), make([]byte, n+1)
+		a[n], b[n] = 0xa5, 0x5a
+		SplitPairs(a[:n], b[:n], src)
+		for i := 0; i < n; i++ {
+			if a[i] != src[2*i] || b[i] != src[2*i+1] {
+				t.Fatalf("n=%d: pair %d is (%d, %d), want (%d, %d)", n, i, a[i], b[i], src[2*i], src[2*i+1])
+			}
+		}
+		if a[n] != 0xa5 || b[n] != 0x5a {
+			t.Fatalf("n=%d: wrote past the end", n)
+		}
+	}
+}
+
+func BenchmarkSplitPairs(b *testing.B) {
+	const n = 960 // a chroma row of a 1920-wide picture
+	src, u, v := make([]byte, 2*n), make([]byte, n), make([]byte, n)
+	b.Run("words", func(b *testing.B) {
+		b.SetBytes(2 * n)
+		for i := 0; i < b.N; i++ {
+			SplitPairs(u, v, src)
+		}
+	})
+	b.Run("bytes", func(b *testing.B) {
+		b.SetBytes(2 * n)
+		for i := 0; i < b.N; i++ {
+			for x := range u {
+				u[x], v[x] = src[2*x], src[2*x+1]
+			}
+		}
+	})
+}
