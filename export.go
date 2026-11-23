@@ -190,7 +190,7 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		var dur time.Duration
 		switch it.kind {
 		case itemImage:
-			img, err := decodeStill(it.path)
+			img, err := decodeStill(it.path, cv.Background)
 			if err != nil {
 				return err
 			}

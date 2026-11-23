@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif" // still image formats
 	_ "image/jpeg"
 	_ "image/png"
@@ -722,7 +723,8 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 }
 
 // decodeStill loads a still image as a frame, honouring EXIF orientation.
-func decodeStill(path string) (*codec.VideoFrame, error) {
+// Transparent parts of the image show bg (nil is black).
+func decodeStill(path string, bg color.Color) (*codec.VideoFrame, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -736,10 +738,15 @@ func decodeStill(path string) (*codec.VideoFrame, error) {
 		}
 		return nil, fmt.Errorf("govideo: %s: %w", path, err)
 	}
-	if yuv, ok := img.(*image.YCbCr); ok && format == "webp" {
+	if format == "webp" {
 		// Lossy WebP is limited-range video Y'CbCr, not JPEG's full range.
-		return process.FromVideoYCbCr(yuv), nil
+		switch m := img.(type) {
+		case *image.YCbCr:
+			return process.FromVideoYCbCr(m), nil
+		case *image.NYCbCrA:
+			return process.FromVideoNYCbCrA(m, bg), nil
+		}
 	}
 	orient := process.EXIFOrientation(bytes.NewReader(data))
-	return process.FromImage(process.Orient(img, orient)), nil
+	return process.FromImageOver(process.Orient(img, orient), bg), nil
 }
