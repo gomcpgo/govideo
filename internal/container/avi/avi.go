@@ -274,6 +274,20 @@ func (s *Stream) ChunkTime(i int) time.Duration {
 	return scaleDur(uint64(s.Start)+uint64(i), uint64(s.Scale), uint64(s.Rate))
 }
 
+// BytesBefore returns the number of payload bytes of an audio stream that
+// come before chunk i: where the chunk starts in the stream's samples, when
+// they are of constant size. i may equal len(Chunks), which gives the size
+// of the stream.
+func (s *Stream) BytesBefore(i int) int64 {
+	if i >= 0 && i < len(s.before) {
+		return s.before[i]
+	}
+	if i < 0 {
+		return 0
+	}
+	return s.TotalBytes
+}
+
 // Duration returns the length of the stream's media, excluding its start
 // delay.
 func (s *Stream) Duration() time.Duration {

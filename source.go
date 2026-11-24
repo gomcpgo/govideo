@@ -12,6 +12,7 @@ import (
 	_ "image/png"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -129,7 +130,7 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 			if int64(t.ID) != s.ID {
 				continue
 			}
-			r := &isoReader{f: m.iso, tr: t, it: t.Iter(), ts: int64(t.Timescale), pcm: pcmFrame > 0}
+			r := &isoReader{f: m.iso, tr: t, it: t.Iter(), ts: int64(t.Timescale), pcm: pcmFrame > 0, pcmFrame: pcmFrame}
 			if pcmFrame > 0 {
 				r.it.SetUniformSize(uint32(pcmFrame))
 			}
@@ -159,7 +160,7 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 				if t.Err != nil {
 					return nil, t.Err
 				}
-				return &mkvReader{f: m.mkv, ctx: ctx, pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay}, nil
+				return &mkvReader{f: m.mkv, ctx: ctx, pr: m.mkv.NewReaderContext(ctx), track: t.Number, delay: t.CodecDelay, pcm: pcmFrame > 0}, nil
 			}
 		}
 	case m.wv != nil:
@@ -223,6 +224,7 @@ type isoReader struct {
 	mediaStart int64
 	shift      time.Duration
 	pcm        bool
+	pcmFrame   int // bytes in a PCM sample frame
 }
 
 func (r *isoReader) next() (packet, error) {
@@ -264,25 +266,73 @@ type syncSeeker interface {
 	seekSync(t time.Duration)
 }
 
-func (r *isoReader) seekSync(t time.Duration) {
-	it := r.tr.Iter()
-	skip := 0
-	for i := 0; ; i++ {
-		s, err := it.Next()
+// audioSeeker is a packetReader of an audio stream that can start partway
+// through it.
+type audioSeeker interface {
+	// seekAudio positions the reader where a decoder can start, as far
+	// into the stream as it can with no more than n passed over, and
+	// returns how much that is. Both are counts: of sample frames for PCM,
+	// of packets for any other codec. It returns 0, and the reader stays at
+	// the start, when the reader cannot place itself by count. It must be
+	// called before the first next.
+	//
+	// Audio is sought by count and not by time because that is how it is
+	// played: the samples of a stream follow one another from the time of
+	// its first packet, whatever the later timestamps say. Those are no
+	// guide to the sample. Matroska rounds them to the millisecond, and MP4
+	// files give packets lengths their samples do not have (a first packet
+	// that lasts 1871 samples and decodes to 1024, in a phone's recording).
+	seekAudio(n int64) (passed int64)
+}
+
+// seek moves the reader to the last sync sample that fits. The samples are
+// offered in decode order, each with the count of what comes before it
+// (sample frames of PCM, else samples), until one is past the place sought.
+// It returns the count before the sample the reader is left at.
+func (r *isoReader) seek(past, fits func(s isobmff.Sample, before int64) bool) (passed int64) {
+	// A copy of the iterator runs ahead through the sample table, which
+	// reads nothing from the file; the reader then takes up the state it had
+	// before the last sample a decoder can start at.
+	ahead, at := *r.it, *r.it
+	var count int64
+	for {
+		here, before := ahead, count
+		var (
+			s   isobmff.Sample
+			n   = 1
+			err error
+		)
+		if r.pcm {
+			s, n, err = ahead.NextBlock(4096)
+		} else {
+			s, err = ahead.Next()
+		}
 		// The index of a file cut short lists samples that were never
 		// written; reading has to start where there is something to read.
-		if err != nil || r.time(s.DTS) > t || !r.f.Present(s) {
+		if err != nil || past(s, before) || !r.f.Present(s) {
 			break
 		}
-		if s.Sync && r.time(s.PTS()) <= t {
-			skip = i
+		if r.pcm {
+			count += int64(s.Size) * int64(n) / int64(r.pcmFrame)
+		} else {
+			count++
+		}
+		if s.Sync && fits(s, before) {
+			at, passed = here, before
 		}
 	}
-	for ; skip > 0; skip-- {
-		if _, err := r.it.Next(); err != nil {
-			return
-		}
-	}
+	*r.it = at
+	return passed
+}
+
+func (r *isoReader) seekSync(t time.Duration) {
+	r.seek(func(s isobmff.Sample, _ int64) bool { return r.time(s.DTS) > t },
+		func(s isobmff.Sample, _ int64) bool { return r.time(s.PTS()) <= t })
+}
+
+func (r *isoReader) seekAudio(n int64) (passed int64) {
+	return r.seek(func(_ isobmff.Sample, before int64) bool { return before > n },
+		func(isobmff.Sample, int64) bool { return true })
 }
 
 type mkvReader struct {
@@ -294,6 +344,7 @@ type mkvReader struct {
 	// than presentation time, so the encoder's priming samples land before
 	// time zero and are cut like any other leading audio.
 	delay time.Duration
+	pcm   bool
 }
 
 func (r *mkvReader) next() (packet, error) {
@@ -312,6 +363,18 @@ func (r *mkvReader) seekSync(t time.Duration) {
 	if pr, ok := r.f.NewReaderAt(r.ctx, r.track, t+r.delay); ok {
 		r.pr = pr
 	}
+}
+
+func (r *mkvReader) seekAudio(n int64) (passed int64) {
+	if r.pcm {
+		// The index counts blocks, and a block of PCM is as many samples
+		// as the muxer chose to put in it.
+		return 0
+	}
+	if pr, ok := r.f.NewReaderAtFrame(r.ctx, r.track, n); ok {
+		r.pr = pr
+	}
+	return r.pr.Passed()
 }
 
 // aviReader reads the chunks of one AVI stream.
@@ -338,6 +401,18 @@ func (r *aviReader) next() (packet, error) {
 	return packet{}, io.EOF
 }
 
+// seekAudio starts at the last chunk of PCM with no more than n sample
+// frames before it.
+func (r *aviReader) seekAudio(n int64) (passed int64) {
+	align := int64(r.s.BlockAlign)
+	if !r.s.IsPCM() || align == 0 {
+		return 0
+	}
+	i := sort.Search(len(r.s.Chunks), func(i int) bool { return r.s.BytesBefore(i)/align > n })
+	r.i = max(i-1, 0)
+	return r.s.BytesBefore(r.i) / align
+}
+
 type wavReader struct {
 	f   io.ReaderAt
 	w   *wav.File
@@ -359,9 +434,23 @@ func (r *wavReader) next() (packet, error) {
 	return packet{pts: pts, data: buf}, nil
 }
 
+func (r *wavReader) seekAudio(n int64) (passed int64) {
+	r.pos = min(max(n, 0), r.w.Frames())
+	return r.pos
+}
+
 // --- audio -------------------------------------------------------------------
 
 // audioStream delivers a source audio stream as 48 kHz stereo float32.
+//
+// A stream that starts well into its source does not decode what comes
+// before: reading starts a run-in ahead of the cut (see audioRunIn). The
+// samples still come out where decoding from the start of the file puts
+// them, to the sample: what was passed over is counted, not timed, the
+// number of samples to drop is still taken from the time of the stream's
+// first packet, and the resampler keeps to the output grid that starts
+// there. So two clips cut from one file at the same point join without a
+// seam, as they did when both were decoded from the start.
 type audioStream struct {
 	rd      packetReader
 	dec     codec.AudioDecoder
@@ -373,6 +462,13 @@ type audioStream struct {
 	decoded int    // packets decoded so far
 	codec   string // codec and profile, for error messages
 	profile string
+
+	// After a seek: the presentation time of the stream's first packet,
+	// which reading did not start at, and how many sample frames, at the
+	// decoder's rate, were passed over.
+	seeked bool
+	first  time.Duration
+	passed int64
 }
 
 func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
@@ -393,6 +489,18 @@ func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
 		SampleRate: s.Audio.SampleRate, Channels: s.Audio.Channels, Config: cfg})
 }
 
+// audioRunIn is how many packets ahead of a cut the decoding of compressed
+// audio starts. A decoder that starts inside a stream has none of the state
+// the earlier packets left: an AAC frame overlaps the one before it, and SBR
+// needs three packets before its output is what a decoder that read the
+// whole stream gives (measured on the system decoder, SPEC §14.1). The
+// output of the run-in is dropped.
+const audioRunIn = 8
+
+// pcmRunIn is the run-in of PCM: there is no decoder state, but the
+// resampler's filter reaches some tens of samples back (4 ms at 8 kHz).
+const pcmRunIn = 20 * time.Millisecond
+
 // openAudio starts reading stream s of m, positioned trim into the stream.
 func openAudio(ctx context.Context, m *media, s *videoprobe.Stream, trim time.Duration) (*audioStream, error) {
 	dec, err := audioDecoder(m, s)
@@ -404,7 +512,71 @@ func openAudio(ctx context.Context, m *media, s *videoprobe.Stream, trim time.Du
 		closeDecoder(dec)
 		return nil, err
 	}
-	return &audioStream{rd: rd, dec: dec, skip: durToFrames(trim), codec: s.Codec, profile: s.Profile}, nil
+	a := &audioStream{rd: rd, dec: dec, skip: durToFrames(trim), codec: s.Codec, profile: s.Profile}
+	a.seek(ctx, m, s, trim)
+	return a, nil
+}
+
+// seek moves the reader to a run-in before the place trim into the stream,
+// if the reader can do that and there is anything to gain. Whatever stops
+// it, the stream is left to be decoded from its start.
+func (a *audioStream) seek(ctx context.Context, m *media, s *videoprobe.Stream, trim time.Duration) {
+	sk, ok := a.rd.(audioSeeker)
+	if !ok || s.Audio == nil || s.Audio.SampleRate < 1 {
+		return
+	}
+	pcm := strings.HasPrefix(s.Codec, "pcm_")
+	// No packet of compressed audio is shorter than 960 samples at the
+	// container's rate: a cut inside the run-in is not looked at further.
+	if !pcm && trim < audioRunIn*960*time.Second/time.Duration(s.Audio.SampleRate) {
+		return
+	}
+	// The stream's first packet, from a reader and a decoder of its own,
+	// gives what a stream read from its start goes by: the time its samples
+	// are counted from, the rate they are decoded at (not the container's,
+	// for HE-AAC) and how many a packet holds.
+	head, err := m.reader(ctx, s)
+	if err != nil {
+		return
+	}
+	p, err := head.next()
+	if err != nil {
+		return
+	}
+	dec, err := audioDecoder(m, s)
+	if err != nil {
+		return
+	}
+	defer closeDecoder(dec)
+	fr, err := dec.Decode(p.data)
+	if err != nil || fr.SampleRate < 1 || fr.Channels < 1 || len(fr.Samples) < fr.Channels {
+		return
+	}
+	n := int64((trim - p.pts).Seconds() * float64(fr.SampleRate)) // samples before the cut
+	per := int64(1)                                               // samples in what the reader counts
+	if pcm {
+		n -= int64(pcmRunIn.Seconds() * float64(fr.SampleRate))
+	} else {
+		// Every packet of the codecs decoded here holds as many samples
+		// as the first. One with packets of several lengths (Opus, Vorbis)
+		// will need its reader to count samples.
+		per = int64(len(fr.Samples) / fr.Channels)
+		runIn := int64(audioRunIn)
+		if m.mkv != nil {
+			for _, t := range m.mkv.Tracks {
+				if int64(t.Number) == s.ID {
+					runIn = max(runIn, int64(t.SeekPreRoll.Seconds()*float64(fr.SampleRate))/per+1)
+				}
+			}
+		}
+		n = n/per - runIn
+	}
+	if n <= 0 {
+		return
+	}
+	if passed := sk.seekAudio(n); passed > 0 {
+		a.seeked, a.first, a.passed = true, p.pts, passed*per
+	}
 }
 
 // closeDecoder releases a decoder that holds operating-system resources.
@@ -418,6 +590,18 @@ func (a *audioStream) close() { closeDecoder(a.dec) }
 
 func durToFrames(d time.Duration) int64 {
 	return int64(float64(d)/1e9*outRate + 0.5)
+}
+
+// lead accounts for n output frames that precede what is decoded next: they
+// are taken from the frames still to drop, and any that are left over are
+// silence.
+func (a *audioStream) lead(n int64) {
+	if n > a.skip {
+		a.buf = append(a.buf, make([]float32, 2*(n-a.skip))...)
+		a.skip = 0
+	} else {
+		a.skip -= n
+	}
 }
 
 // read fills dst (interleaved stereo) and returns the number of frames
@@ -452,17 +636,17 @@ func (a *audioStream) read(dst []float32) (int, error) {
 			a.decoded++
 			if !a.started {
 				a.started = true
-				// A positive first timestamp is leading silence; a negative
-				// one (encoder priming) is trimmed.
-				if lead := durToFrames(p.pts); p.pts > 0 {
-					if lead > a.skip {
-						a.buf = append(a.buf, make([]float32, 2*(lead-a.skip))...)
-						a.skip = 0
-					} else {
-						a.skip -= lead
-					}
-				} else if p.pts < 0 {
-					a.skip += durToFrames(-p.pts)
+				// The stream's first packet places the samples: a positive
+				// first timestamp is leading silence; a negative one
+				// (encoder priming) is trimmed.
+				first := p.pts
+				if a.seeked {
+					first = a.first
+				}
+				if lead := durToFrames(first); first > 0 {
+					a.lead(lead)
+				} else if first < 0 {
+					a.skip += durToFrames(-first)
 				}
 			}
 			if a.rs == nil {
@@ -472,6 +656,10 @@ func (a *audioStream) read(dst []float32) (int, error) {
 					return 0, errors.New("govideo: audio decoder returned no format")
 				}
 				a.rs = process.NewResampler(fr.SampleRate, outRate, 2)
+				// After a seek the decoder's first sample is not the
+				// stream's: the resampler is told which it is, and says
+				// which output frame it will start with.
+				a.lead(a.rs.StartAt(a.passed))
 			}
 			out = a.rs.Process(process.ToStereo(fr.Samples, fr.Channels))
 		}

@@ -235,8 +235,69 @@ func corpusVideo(t *testing.T, dir string) {
 					t.Errorf("frame %d after the cut at %v differs from the oracle's decode (PSNR %.1f dB)", n, cut, best)
 				}
 			}
+			// The sound is cut at the same place, and its decoder too starts
+			// near the cut, not at the start of the file (govideo#23). The
+			// clip's time starts at its first video frame; the oracle is
+			// asked to keep the audio where its timestamps put it, with
+			// silence before a late start.
+			var origin time.Duration
+			sounds := false
+			for _, st := range info.Streams {
+				switch st.Kind {
+				case videoprobe.Video:
+					if origin == 0 {
+						origin = max(st.StartTime, 0)
+					}
+				case videoprobe.Audio:
+					sounds = true
+				}
+			}
+			if !sounds {
+				return
+			}
+			sound := oracle.Audio(t, in, "0:a:0", "-af", "aresample=async=1:first_pts=0,aformat=channel_layouts=stereo")
+			from := int((origin + cut) * 48000 / time.Second)
+			if from >= len(sound) {
+				return
+			}
+			sound = sound[from:]
+			var energy float64
+			for _, v := range sound[:min(len(sound), 48000)] {
+				energy += float64(v) * float64(v)
+			}
+			if energy < 48000*2e-3*2e-3 {
+				t.Logf("too quiet after the cut to compare the sound")
+				return
+			}
+			// As in corpusAudio: decoders differ in the SBR delay they remove.
+			if best, n := correlate(oracle.Audio(t, out, "0:a:0"), sound, 2048); n > 0 && best < 0.9 {
+				t.Errorf("audio after the cut at %v correlates %.3f with the oracle's decode, want at least 0.9 (wrong timing or content)", cut, best)
+			} else if n > 0 {
+				t.Logf("audio after the cut at %v correlates %.3f with the oracle's decode", cut, best)
+			}
 		})
 	}
+}
+
+// correlate returns how well ours follows ref (1 is a perfect match) at the
+// shift of up to span samples either way that suits best, over the first two
+// seconds, and how many samples that was measured on: 0 when there are too
+// few.
+func correlate(ours, ref []float32, span int) (best float64, n int) {
+	n = min(len(ours), len(ref), 2*48000) - 2*span
+	if n < 4800 {
+		return 0, 0
+	}
+	best = -1.0
+	for lag := -span; lag <= span; lag++ {
+		var xy, xx, yy float64
+		for i := span; i < span+n; i++ {
+			x, y := float64(ours[i+lag]), float64(ref[i])
+			xy, xx, yy = xy+x*y, xx+x*x, yy+y*y
+		}
+		best = max(best, xy/math.Sqrt(xx*yy+1e-30))
+	}
+	return best, n
 }
 
 func corpusAudio(t *testing.T, dir string) {
@@ -273,7 +334,17 @@ func corpusAudio(t *testing.T, dir string) {
 			}
 			// oracle.Audio folds both sides to mono, so the reference has to
 			// reach stereo the way the export does for the levels to compare.
-			switch ch := info.Streams[0].Audio.Channels; {
+			// The oracle can decode more channels than the container declares
+			// (parametric stereo makes two of a mono core), and it is what it
+			// decodes that its filters are given.
+			ch := info.Streams[0].Audio.Channels
+			for _, st := range oracle.FFprobe(t, in).Streams {
+				if st.CodecType == "audio" && st.Channels > 0 {
+					ch = st.Channels
+					break
+				}
+			}
+			switch {
 			case ch == 1: // duplicated at unity
 				ref = oracle.Audio(t, in, "0:a:0", "-af", "pan=stereo|c0=c0|c1=c0")
 			case ch > 2: // the oracle's stereo downmix; its 5.1-to-mono weights differ
@@ -286,18 +357,9 @@ func corpusAudio(t *testing.T, dir string) {
 			if !strings.HasPrefix(info.Streams[0].Codec, "pcm") {
 				span = 2048
 			}
-			n := min(len(ours), len(ref), 2*48000) - 2*span
-			if n < 4800 {
+			best, n := correlate(ours, ref, span)
+			if n == 0 {
 				return
-			}
-			best := -1.0
-			for lag := -span; lag <= span; lag++ {
-				var xy, xx, yy float64
-				for i := span; i < span+n; i++ {
-					x, y := float64(ours[i+lag]), float64(ref[i])
-					xy, xx, yy = xy+x*y, xx+x*x, yy+y*y
-				}
-				best = max(best, xy/math.Sqrt(xx*yy+1e-30))
 			}
 			if best < 0.97 {
 				t.Errorf("audio correlates %.3f with the oracle's decode, want at least 0.97 (wrong timing or content)", best)
@@ -313,6 +375,25 @@ func corpusAudio(t *testing.T, dir string) {
 				if db := 10 * math.Log10(eo/er); math.Abs(db) > 1 {
 					t.Errorf("audio is %+.1f dB from the oracle's level", db)
 				}
+			}
+			// A trim that starts inside the file starts the decoder near the
+			// cut (govideo#23). What follows must still be what the oracle
+			// has there.
+			cut := min(time.Duration(len(ref))*time.Second/48000*2/3, 20*time.Second).Truncate(100 * time.Millisecond)
+			if cut < time.Second {
+				return
+			}
+			tl = govideo.NewTimeline(govideo.Canvas{Width: 320, Height: 180, FrameRate: govideo.R(30, 1)})
+			tl.AddGenerated(time.Second, govideo.GenerateOptions{})
+			tl.AddAudio(in, govideo.AudioOptions{Trim: govideo.Range(cut, 0)})
+			trimmed := filepath.Join(tmp, name+".trim.mov")
+			if err := tl.Export(context.Background(), trimmed, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+				t.Fatalf("export from %v: %v", cut, err)
+			}
+			defer os.Remove(trimmed)
+			after := ref[int(cut*48000/time.Second):]
+			if best, n := correlate(oracle.Audio(t, trimmed, "0:a:0"), after, span); n > 0 && best < 0.97 {
+				t.Errorf("audio from %v correlates %.3f with the oracle's decode, want at least 0.97 (wrong timing or content)", cut, best)
 			}
 		})
 	}

@@ -72,6 +72,26 @@ func (r *Resampler) reset() {
 	r.totalIn, r.n = 0, 0
 }
 
+// StartAt declares that the input which follows begins at frame in of the
+// signal, not at its start, and returns the index of the first output frame
+// that will be produced. The output frames keep the positions they have when
+// the signal is converted from its start, so what follows is what that
+// conversion gives from the returned frame on, but for the first few frames:
+// the input before frame in counts as silence. It must be called before any
+// input is processed.
+func (r *Resampler) StartAt(in int64) (out int64) {
+	if in <= 0 {
+		return 0
+	}
+	if r.pass {
+		return in
+	}
+	r.bufStart = in - int64(r.half-1)
+	r.totalIn = in
+	r.n = (in*r.l + r.m - 1) / r.m
+	return r.n
+}
+
 func besselI0(x float64) float64 {
 	sum, term := 1.0, 1.0
 	h := x / 2
