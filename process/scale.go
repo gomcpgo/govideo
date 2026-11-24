@@ -45,7 +45,17 @@ func catmullRom(t float64) float64 {
 // low-passes (no aliasing). Weights for each output sum to exactly
 // 1<<kernels.FilterShift, so flat areas are preserved bit-exactly.
 func makeFilter(srcN, dstN int) resampleFilter {
-	ratio := float64(srcN) / float64(dstN)
+	return makeFilterAt(srcN, 0, dstN, 0, float64(dstN))
+}
+
+// makeFilterAt is makeFilter for a picture that need not start or end on a
+// whole output sample: the srcN source samples are spread over size output
+// samples from position off, and the filter is built for the output samples
+// d0 to d1-1 (its entry i is output sample d0+i). Past either end of the
+// source the edge sample is repeated.
+func makeFilterAt(srcN, d0, d1 int, off, size float64) resampleFilter {
+	dstN := d1 - d0
+	ratio := float64(srcN) / size
 	scale := math.Max(1, ratio)
 	support := 2 * scale
 	taps := int(math.Ceil(2*support)) + 1
@@ -57,7 +67,7 @@ func makeFilter(srcN, dstN int) resampleFilter {
 	tmp := make([]float64, eff)
 	const one = 1 << kernels.FilterShift
 	for i := 0; i < dstN; i++ {
-		center := (float64(i)+0.5)*ratio - 0.5
+		center := (float64(d0+i)+0.5-off)*ratio - 0.5
 		left := int(math.Ceil(center - support))
 		start := left
 		if start > srcN-eff {

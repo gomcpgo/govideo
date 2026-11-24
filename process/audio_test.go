@@ -346,3 +346,68 @@ func TestSoftClip(t *testing.T) {
 		prev = v[0]
 	}
 }
+
+func TestCrossfade(t *testing.T) {
+	const total = 1000
+	ones := func(n int, v float32) []float32 {
+		s := make([]float32, n)
+		for i := range s {
+			s[i] = v
+		}
+		return s
+	}
+	// The outgoing track alone gives its gain, the incoming alone its own.
+	out, in := ones(2*total, 1), make([]float32, 2*total)
+	Crossfade(out, in, 2, 0, total)
+	gin := ones(2*total, 0)
+	Crossfade(gin, ones(2*total, 1), 2, 0, total)
+	for i := 0; i < total; i++ {
+		o, n := float64(out[2*i]), float64(gin[2*i])
+		if out[2*i+1] != out[2*i] || gin[2*i+1] != gin[2*i] {
+			t.Fatalf("frame %d: the channels differ", i)
+		}
+		if math.Abs(o*o+n*n-1) > 1e-6 {
+			t.Fatalf("frame %d: gains %v and %v, squares sum to %v", i, o, n, o*o+n*n)
+		}
+		// The curves are mirror images.
+		if m := float64(gin[2*(total-1-i)]); math.Abs(o-m) > 1e-6 {
+			t.Fatalf("frame %d: outgoing gain %v, incoming gain at the mirror position %v", i, o, m)
+		}
+		if i > 0 && (out[2*i] > out[2*i-2] || gin[2*i] < gin[2*i-2]) {
+			t.Fatalf("frame %d: the gains do not run one way", i)
+		}
+	}
+	if out[0] < 0.999 || out[2*total-2] > 0.002 || gin[0] > 0.002 || gin[2*total-2] < 0.999 {
+		t.Errorf("ends: outgoing %v to %v, incoming %v to %v", out[0], out[2*total-2], gin[0], gin[2*total-2])
+	}
+	if mid := float64(out[total]); math.Abs(mid-math.Sqrt2/2) > 0.002 {
+		t.Errorf("middle: gain %v, want -3 dB", mid)
+	}
+	// Any chunking gives the same samples.
+	whole := sine(440, 48000, total, 2, 0.5)
+	other := sine(1000, 48000, total, 2, 0.5)
+	want := append([]float32(nil), whole...)
+	Crossfade(want, other, 2, 0, total)
+	got := append([]float32(nil), whole...)
+	for pos := 0; pos < total; {
+		n := min(1+pos%97, total-pos)
+		Crossfade(got[2*pos:2*(pos+n)], other[2*pos:2*(pos+n)], 2, int64(pos), total)
+		pos += n
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sample %d: %v in chunks, %v whole", i, got[i], want[i])
+		}
+	}
+	// Positions outside the crossfade hold the end gains; no length does nothing.
+	o := []float32{1, 1}
+	Crossfade(o, []float32{0.5, 0.5}, 2, total+5, total)
+	if o[0] != 0.5 {
+		t.Errorf("past the end: %v, want the incoming track alone", o[0])
+	}
+	o = []float32{1, 1}
+	Crossfade(o, []float32{0.5, 0.5}, 2, 0, 0)
+	if o[0] != 1 {
+		t.Errorf("no length: %v, want the outgoing track untouched", o[0])
+	}
+}

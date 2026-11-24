@@ -44,8 +44,14 @@ tl.AddGenerated(2*time.Second, govideo.GenerateOptions{
     Pattern: govideo.PatternGradient, Color: color.RGBA{20, 30, 90, 255}, Color2: color.Black,
     Text:    "Summer 2026",
 })
-tl.AddImage("title.png", 3*time.Second, govideo.ImageOptions{})
-tl.AddClip("intro.mov", govideo.ClipOptions{Trim: govideo.Range(2*time.Second, 14*time.Second)})
+tl.AddImage("title.png", 3*time.Second, govideo.ImageOptions{
+    To: govideo.Placement{Scale: 1.15}, // a slow zoom in
+})
+tl.AddClip("intro.mov", govideo.ClipOptions{
+    Trim:       govideo.Range(2*time.Second, 14*time.Second),
+    Transition: govideo.Transition{Type: govideo.Crossfade, Duration: time.Second / 2},
+    FadeOut:    time.Second,
+})
 tl.AddAudio("music.wav", govideo.AudioOptions{Mode: govideo.Mix, Gain: 0.3, FadeOut: 2 * time.Second})
 tl.AddCaptions("subs.srt", govideo.CaptionOptions{Sidecar: true})
 
@@ -60,6 +66,8 @@ What works today:
 - **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Interlaced H.264 is deinterlaced: each frame is shown as its two fields, in the order the stream gives, so a 50 or 60 fps canvas keeps all of the motion and a slower one shows no combing. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
 - **Still images** (PNG, JPEG with EXIF orientation, GIF, WebP) shown for a set duration. Transparent parts show the canvas background colour.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
+- **Pan and zoom over a still** ("Ken Burns"): `ImageOptions.From` and `To` give where the picture sits at the start and at the end (a magnification and an offset from the centre), and it moves between them at a steady rate, positioned to a fraction of a pixel so that slow motion is smooth.
+- **Fades and crossfades.** `FadeIn` and `FadeOut` on any clip, image or generated segment fade its picture from and to the canvas background and its sound from and to silence. `Transition` on a segment dissolves the one before into it, picture and sound, over the given time; the two overlap for that long, so the timeline gets shorter by it. Times given to `AddAudio` and caption files refer to the timeline as it then is.
 - **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
 - **Audio** from WAV files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
 - **Captions** from SRT or WebVTT as a soft subtitle track (`tx3g`), with an optional `.vtt` sidecar for web players.
@@ -88,7 +96,7 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |

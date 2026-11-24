@@ -118,3 +118,32 @@ func MixInto(dst, src []float32) { kernels.MixAdd(dst, src) }
 // SoftClip is the mixer's clipping protection: samples below about ±0.9
 // pass unchanged, louder ones are smoothly limited to ±1, NaN becomes 0.
 func SoftClip(s []float32) { kernels.SoftClip(s) }
+
+// Crossfade mixes a block of an incoming track into the same block of an
+// outgoing one, in place in out, with equal-power gains: the outgoing track
+// is scaled by the cosine and the incoming one by the sine of an angle that
+// runs from 0 to a quarter turn over the crossfade. The two gains squared
+// always sum to one, so two unrelated sounds keep their combined loudness
+// through the join; with straight-line gains it would dip by 3 dB at the
+// middle. Both blocks are interleaved with the given channel count.
+// startFrame is the position of the first frame of the blocks within a
+// crossfade of total frames; blocks can be processed in any chunking with
+// identical results.
+func Crossfade(out, in []float32, channels int, startFrame, total int64) {
+	if channels < 1 || total <= 0 {
+		return
+	}
+	frames := min(len(out), len(in)) / channels
+	for i := 0; i < frames; i++ {
+		// The gains at the middle of the sample period, which makes the two
+		// curves mirror images of each other.
+		x := (float64(startFrame+int64(i)) + 0.5) / float64(total)
+		x = max(0, min(x, 1))
+		sin, cos := math.Sincos(x * math.Pi / 2)
+		gin, gout := float32(sin), float32(cos)
+		o, n := out[i*channels:(i+1)*channels], in[i*channels:(i+1)*channels]
+		for c := range o {
+			o[c] = o[c]*gout + n[c]*gin
+		}
+	}
+}

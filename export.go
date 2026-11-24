@@ -91,19 +91,6 @@ func resolveProfile(p Profile) (Profile, error) {
 	return ProfileIntermediate, nil
 }
 
-// segment is one timeline item prepared for export.
-type segment struct {
-	frames int64 // output frames
-	trim   time.Duration
-	origin time.Duration     // source time of the clip's first video frame
-	video  *videoStream      // nil for stills and audio-only clips
-	still  *codec.VideoFrame // canvas-sized
-	audio  *audioStream      // nil for silence
-	gen    *generator        // animated generated picture
-	tone   *tone             // generated audio
-	gain   float32
-}
-
 // overlay is an added audio file prepared for export.
 type overlay struct {
 	as            *audioStream
@@ -179,24 +166,40 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 
 	// Prepare segments. Boundaries are rounded on the cumulative timeline so
 	// rounding never accumulates.
-	var cum time.Duration
+	var (
+		cum  time.Duration // where the previous segment ends on the timeline
+		free time.Duration // how much of it its own transition leaves unmixed
+	)
 	// Frame selection tolerance: four tenths of an output frame (see
 	// videoStream.frameAt).
 	slack := time.Duration(0.4 * float64(fps.Den) / float64(fps.Num) * 1e9)
 	frameAtTime := func(d time.Duration) int64 {
 		return int64(d.Seconds()*fps.Float() + 0.5)
 	}
-	for _, it := range t.items {
-		sg := &segment{gain: 1}
+	for i, it := range t.items {
+		sg := &segment{gain: 1, cv: cv, fit: fit}
 		segs = append(segs, sg) // owned from here on, so its decoders get closed
 		var dur time.Duration
 		switch it.kind {
 		case itemImage:
+			from, to := it.image.From.normal(), it.image.To.normal()
+			for _, p := range []Placement{from, to} {
+				if err := p.check(); err != nil {
+					return fmt.Errorf("govideo: %s: %w", it.path, err)
+				}
+			}
 			img, err := decodeStill(it.path, cv.Background)
 			if err != nil {
 				return err
 			}
-			sg.still = process.Fit(img, cv.Width, cv.Height, fit, cv.Background)
+			switch {
+			case from != to:
+				sg.zoom = newPanZoom(img, cv, fit, from, to)
+			case from != (Placement{Scale: 1}):
+				sg.still = newPanZoom(img, cv, fit, from, to).frame(0) // placed, but at rest
+			default:
+				sg.still = process.Fit(img, cv.Width, cv.Height, fit, cv.Background)
+			}
 			dur = it.dur
 		case itemGenerated:
 			g, err := newGenerator(cv, it.gen)
@@ -266,20 +269,50 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		if dur <= 0 {
 			return fmt.Errorf("govideo: %s: duration must be positive", it.label())
 		}
-		first := frameAtTime(cum)
-		cum += dur
-		sg.frames = frameAtTime(cum) - first
+		fadeIn, fadeOut, tr := it.joining()
+		if fadeIn < 0 || fadeOut < 0 || tr.Duration < 0 {
+			return fmt.Errorf("govideo: %s: fade and transition durations must not be negative", it.label())
+		}
+		if tr.Type != Crossfade {
+			return fmt.Errorf("govideo: %s: unknown transition type %d", it.label(), tr.Type)
+		}
+		// A transition lays the start of this segment over the end of the
+		// one before. Neither may be mixed twice over: then no more than two
+		// segments are ever on screen together.
+		switch over := tr.Duration; {
+		case over == 0:
+		case i == 0:
+			return fmt.Errorf("govideo: %s: the first segment cannot have a transition: nothing comes before it", it.label())
+		case over > free:
+			return fmt.Errorf("govideo: %s: the %v transition is longer than what the segment before it has left (%v)", it.label(), over, free)
+		case over > dur:
+			return fmt.Errorf("govideo: %s: the %v transition is longer than the segment (%v)", it.label(), over, dur)
+		}
+		begin := cum - tr.Duration
+		cum = begin + dur
+		free = dur - tr.Duration
+		sg.start = frameAtTime(begin)
+		sg.frames = frameAtTime(cum) - sg.start
+		sg.fadeIn, sg.fadeOut = frameAtTime(fadeIn), frameAtTime(fadeOut)
+		if sg.zoom != nil {
+			sg.zoom.frames = sg.frames
+		}
 	}
-	var totalFrames int64
-	for _, sg := range segs {
-		totalFrames += sg.frames
-	}
+	totalFrames := segs[len(segs)-1].end()
 	if totalFrames == 0 {
 		return errors.New("govideo: the timeline is shorter than one frame")
 	}
 	// audioPos maps an output frame index to a 48 kHz sample position.
 	audioPos := func(frame int64) int64 { return frame * outRate * fps.Den / fps.Num }
 	totalAudio := audioPos(totalFrames)
+	for _, sg := range segs {
+		// The sound is faded over the samples of the frames the picture is
+		// faded over.
+		first, last := audioPos(sg.start), audioPos(sg.end())
+		sg.alen = last - first
+		sg.afadeIn = audioPos(sg.start+sg.fadeIn) - first
+		sg.afadeOut = last - audioPos(sg.end()-sg.fadeOut)
+	}
 	total := time.Duration(float64(totalFrames) / fps.Float() * 1e9)
 
 	// Muxer and tracks.
@@ -394,104 +427,122 @@ func (t *Timeline) Export(ctx context.Context, path string, o ExportOptions) (er
 		}
 	}
 
-	// Render.
+	// Render. At any output frame one segment is on, or two that a
+	// transition joins: the outgoing one (out) and the incoming one (in).
 	var (
-		frame   int64
-		prog    []float32
-		side    []float32
-		lastKey [2]int64
+		prog, side, inc []float32
+		lastKey         [2]int64
+		// Frames that mixed pictures are written to, reused for every frame:
+		// the two segments' pictures over the background, and their mix.
+		shadeOut, shadeIn, mixed *codec.VideoFrame
+		cur                      int // the earliest segment still on
 	)
-	for si, sg := range segs {
-		for n := int64(0); n < sg.frames; n++ {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			// Video: pick the source frame for this output time.
-			key := [2]int64{int64(si) + 1, 0}
-			var pic *codec.VideoFrame
-			if sg.video != nil {
-				ts := sg.origin + sg.trim + time.Duration(float64(n)*float64(fps.Den)/float64(fps.Num)*1e9)
-				src, seq, err := sg.video.frameAt(ts)
-				if err != nil {
-					return err
-				}
-				key[1] = seq
-				if key != lastKey {
-					pic = process.Fit(src, cv.Width, cv.Height, fit, cv.Background)
-				}
-			} else if sg.gen != nil {
-				key[1] = n + 1
-				pic = sg.gen.frame(n)
-			} else if key != lastKey {
-				pic = sg.still
-			}
-			if pic != nil {
-				lastKey = key
-			}
-			if err := vsink.write(pic); err != nil {
-				return err
-			}
+	// shaded returns frame n of a segment as it shows through its fades.
+	shaded := func(sg *segment, n int64, pic *codec.VideoFrame, scratch **codec.VideoFrame) *codec.VideoFrame {
+		g := sg.opacity(n)
+		if g >= 1 {
+			return pic
+		}
+		*scratch = process.FadeInto(*scratch, pic, cv.Background, g)
+		return *scratch
+	}
+	for frame := int64(0); frame < totalFrames; frame++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		for segs[cur].end() <= frame {
+			segs[cur].done()
+			cur++
+		}
+		out := segs[cur]
+		var in *segment
+		if cur+1 < len(segs) && segs[cur+1].start <= frame {
+			in = segs[cur+1]
+		}
 
-			// Audio for the span of this frame.
-			a0, a1 := audioPos(frame), audioPos(frame+1)
-			count := int(a1 - a0)
-			prog = resize(prog, count*2)
-			if sg.audio != nil {
-				got, err := sg.audio.read(prog)
+		// Video. A picture that is the same as the last one written is not
+		// sent again: the sink repeats it.
+		n := frame - out.start
+		src, id, err := out.picture(n)
+		if err != nil {
+			return err
+		}
+		var pic *codec.VideoFrame
+		if in == nil && out.opacity(n) >= 1 {
+			if key := [2]int64{int64(cur) + 1, id}; key != lastKey {
+				pic, lastKey = src, key
+			}
+		} else {
+			pic = shaded(out, n, src, &shadeOut)
+			if in != nil {
+				m := frame - in.start
+				next, _, err := in.picture(m)
 				if err != nil {
 					return err
 				}
-				_ = got // a short read leaves silence: audio is padded to the video length
-				if sg.gain != 1 {
-					process.ApplyGain(prog, sg.gain)
-				}
-			} else if sg.tone != nil {
-				sg.tone.fill(prog)
+				next = shaded(in, m, next, &shadeIn)
+				mixed = process.BlendInto(mixed, pic, next, (float64(m)+0.5)/float64(out.end()-in.start))
+				pic = mixed
 			}
-			for _, ov := range overlays {
-				lo, hi := max(a0, ov.start), min(a1, ov.start+ov.length)
-				side = resize(side, count*2)
-				if hi > lo {
-					part := side[(lo-a0)*2 : (hi-a0)*2]
-					if _, err := ov.as.read(part); err != nil {
-						return err
-					}
-					if g := ov.opts.Gain; g != 0 && g != 1 {
-						process.ApplyGain(part, float32(g))
-					}
-					if ov.opts.FadeIn > 0 || ov.opts.FadeOut > 0 {
-						process.ApplyFade(part, 2, ov.pos, durToFrames(ov.opts.FadeIn), durToFrames(ov.opts.FadeOut), ov.length)
-					}
-					ov.pos += hi - lo
-					switch ov.opts.Mode {
-					case Mix:
-						process.MixInto(prog[(lo-a0)*2:], part)
-					case Replace:
-						copy(prog[(lo-a0)*2:], part)
-					}
-				}
-				if ov.sink != nil && count > 0 {
-					process.SoftClip(side)
-					if err := ov.sink.write(side); err != nil {
-						return err
-					}
-				}
+			lastKey = [2]int64{} // a mix is never repeated
+		}
+		if err := vsink.write(pic); err != nil {
+			return err
+		}
+
+		// Audio for the span of this frame.
+		a0, a1 := audioPos(frame), audioPos(frame+1)
+		count := int(a1 - a0)
+		prog = resize(prog, count*2)
+		if err := out.sound(prog); err != nil {
+			return err
+		}
+		if in != nil {
+			inc = resize(inc, count*2)
+			if err := in.sound(inc); err != nil {
+				return err
 			}
-			if count > 0 {
-				process.SoftClip(prog)
-				if err := asink.write(prog); err != nil {
+			first := audioPos(in.start)
+			process.Crossfade(prog, inc, 2, a0-first, audioPos(out.end())-first)
+		}
+		for _, ov := range overlays {
+			lo, hi := max(a0, ov.start), min(a1, ov.start+ov.length)
+			side = resize(side, count*2)
+			if hi > lo {
+				part := side[(lo-a0)*2 : (hi-a0)*2]
+				if _, err := ov.as.read(part); err != nil {
 					return err
 				}
+				if g := ov.opts.Gain; g != 0 && g != 1 {
+					process.ApplyGain(part, float32(g))
+				}
+				if ov.opts.FadeIn > 0 || ov.opts.FadeOut > 0 {
+					process.ApplyFade(part, 2, ov.pos, durToFrames(ov.opts.FadeIn), durToFrames(ov.opts.FadeOut), ov.length)
+				}
+				ov.pos += hi - lo
+				switch ov.opts.Mode {
+				case Mix:
+					process.MixInto(prog[(lo-a0)*2:], part)
+				case Replace:
+					copy(prog[(lo-a0)*2:], part)
+				}
 			}
-			frame++
-			if o.Progress != nil {
-				o.Progress(Progress{Frame: frame, TotalFrames: totalFrames,
-					Time: time.Duration(float64(frame) / fps.Float() * 1e9), Duration: total})
+			if ov.sink != nil && count > 0 {
+				process.SoftClip(side)
+				if err := ov.sink.write(side); err != nil {
+					return err
+				}
 			}
 		}
-		// The clip is done: its decoder goes on to the next clip.
-		if sg.video != nil {
-			sg.video.close()
+		if count > 0 {
+			process.SoftClip(prog)
+			if err := asink.write(prog); err != nil {
+				return err
+			}
+		}
+		if o.Progress != nil {
+			o.Progress(Progress{Frame: frame + 1, TotalFrames: totalFrames,
+				Time: time.Duration(float64(frame+1) / fps.Float() * 1e9), Duration: total})
 		}
 	}
 
