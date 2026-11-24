@@ -2,6 +2,7 @@ package govideo
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -122,5 +123,95 @@ func TestVideoStreamSteadyState(t *testing.T) {
 	}
 	if len(decs.idle) != 1 || len(decs.frames) != 1 {
 		t.Errorf("close left %d decoders and %d frames for the next clip, want 1 and 1", len(decs.idle), len(decs.frames))
+	}
+}
+
+// TestAudioSeek checks that a stream opened partway through its source
+// gives the samples a stream read from the start gives there, and gets them
+// without decoding what comes before. The signal is a rising tone in each
+// channel, so a shift of a sample shows; the Matroska file's timestamps are
+// whole milliseconds, which no packet of 1024 samples starts on.
+func TestAudioSeek(t *testing.T) {
+	oracle.Require(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	const length = 20
+	tone := []string{"-f", "lavfi", "-i", "aevalsrc=0.4*sin(2*PI*(200+60*t)*t)|0.4*sin(2*PI*(300+45*t)*t):d=20:s=44100"}
+	picture := []string{"-f", "lavfi", "-i", "testsrc2=d=20:s=160x120:r=10"}
+	// Noise substitution is left out of the AAC: the noise a decoder makes
+	// up depends on everything it has decoded.
+	aac := []string{"-c:a", "aac", "-aac_pns", "0", "-b:a", "128k"}
+	for _, c := range []struct {
+		name string
+		args []string
+		os   bool // needs the system decoder
+	}{
+		{"lc.m4a", append(tone, aac...), true},
+		{"lc.mkv", append(tone, aac...), true},
+		{"lc48.mp4", append(append(picture, tone...), append(aac, "-ar", "48000", "-c:v", "mjpeg")...), true},
+		{"lc22.m4a", append(tone, append(aac, "-ar", "22050", "-b:a", "64k")...), true},
+		{"he.m4a", append(tone, "-c:a", "aac_at", "-profile:a", "4", "-b:a", "64k"), true},
+		{"he.mkv", append(tone, "-c:a", "aac_at", "-profile:a", "4", "-b:a", "64k"), true},
+		{"pcm.wav", tone, false},
+		{"pcm.mov", append(tone, "-c:a", "pcm_s16le"), false},
+		{"pcm48.mov", append(tone, "-c:a", "pcm_s24be", "-ar", "48000"), false},
+		{"pcm.avi", append(append(picture, tone...), "-c:v", "mjpeg", "-c:a", "pcm_s16le"), false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if c.os && !BuildInfo().OSBackend {
+				t.Skip("no operating-system codec backend on this platform")
+			}
+			path := filepath.Join(dir, c.name)
+			if err := oracle.TryFFmpeg(append(append([]string(nil), c.args...), path)...); err != nil {
+				t.Skipf("the oracle cannot make this fixture: %v", err)
+			}
+			m, err := openMedia(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer m.close()
+			as := m.stream(videoprobe.Audio)
+			// read returns n sample frames from the place at into the stream,
+			// reached by cutting there or by reading up to it.
+			read := func(cut, at time.Duration, n int) ([]float32, *audioStream) {
+				a, err := openAudio(ctx, m, as, cut)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer a.close()
+				buf := make([]float32, 2*(int(durToFrames(at-cut))+n))
+				got, err := a.read(buf)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return buf[2*(got-min(got, n)) : 2*got], a
+			}
+			const n = outRate / 2
+			for _, cut := range []time.Duration{50 * time.Millisecond, 3210 * time.Millisecond, 11 * time.Second, 17537100 * time.Microsecond} {
+				whole, all := read(0, cut, n)
+				part, a := read(cut, cut, n)
+				if len(whole) != 2*n || len(part) != 2*n {
+					t.Fatalf("cut at %v: %d samples read from the start, %d from the cut, want %d", cut, len(whole)/2, len(part)/2, n)
+				}
+				worst, at := 0.0, 0
+				for i := range whole {
+					if d := math.Abs(float64(whole[i] - part[i])); d > worst {
+						worst, at = d, i/2
+					}
+				}
+				if worst > 1e-4 {
+					t.Errorf("cut at %v: sample %d differs by %.5f from the stream read from the start", cut, at, worst)
+				}
+				// A cut well into the file must not cost what the file before
+				// it does. (Matroska audio starts at a Cluster, up to five
+				// seconds back in what the oracle writes.)
+				if cut >= 10*time.Second {
+					if !a.seeked || a.decoded*3 > all.decoded {
+						t.Errorf("cut at %v: %d packets decoded (seeked: %v); %d when read from the start", cut, a.decoded, a.seeked, all.decoded)
+					}
+				}
+				t.Logf("cut at %v: %d packets decoded, %d from the start; largest difference %.1e", cut, a.decoded, all.decoded, worst)
+			}
+		})
 	}
 }

@@ -136,14 +136,16 @@ type Track struct {
 
 	strip []byte      // header-stripping compression: bytes to prepend to frames
 	zlib  bool        // frames are zlib-compressed
-	seek  []seekPoint // keyframe index, in file order (video tracks only)
+	seek  []seekPoint // where a decoder can start, in file order (video and audio tracks)
 }
 
-// seekPoint is a place a decoder can start: a keyframe of the track and the
-// Cluster that holds it.
+// seekPoint is a place a decoder can start: a keyframe of a video track, or
+// the first block of an audio track in a Cluster, and the Cluster that holds
+// it.
 type seekPoint struct {
-	ts  int64 // the keyframe's timestamp, in ticks
-	pos int64 // offset of the Cluster element
+	ts     int64 // the block's timestamp, in ticks
+	pos    int64 // offset of the Cluster element
+	frames int64 // frames of the track that come before the block
 }
 
 type trackStats struct {
@@ -155,6 +157,7 @@ type trackStats struct {
 	first      []byte
 	haveFirst  bool
 	timestamps []int64
+	cluster    int64 // the Cluster the track's block last seen is in
 }
 
 type pendingTag struct {
@@ -271,10 +274,9 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 			if len(stats) >= maxStatTracks {
 				continue
 			}
-			st = &trackStats{minTS: b.ts, maxTS: b.ts, maxTSDur: b.dur}
+			st = &trackStats{minTS: b.ts, maxTS: b.ts, maxTSDur: b.dur, cluster: -1}
 			stats[b.track] = st
 		}
-		st.frames += int64(b.laced) + 1
 		st.bytes += b.size
 		if b.ts < st.minTS {
 			st.minTS = b.ts
@@ -290,13 +292,26 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 			st.haveFirst = true
 			st.first = firstFrame(rd, b)
 		}
-		// The keyframe index takes every keyframe, since a Cluster may hold
-		// several. A full index stops growing: seeks past its end start
-		// earlier than they need to, which costs time but not correctness.
-		if t := f.byNum[b.track]; b.key && seekBudget > 0 && t != nil && t.Type == TrackVideo {
-			t.seek = append(t.seek, seekPoint{ts: b.ts, pos: w.clusterPos})
-			seekBudget--
+		// The keyframe index takes every keyframe of a video track, since a
+		// Cluster may hold several. Audio can start at any block, so there
+		// the first block of each Cluster is enough: a seek then decodes at
+		// most a Cluster more than it needs. A full index stops growing:
+		// seeks past its end start earlier than they need to, which costs
+		// time but not correctness.
+		if t := f.byNum[b.track]; t != nil && seekBudget > 0 {
+			switch {
+			case t.Type == TrackVideo && b.key:
+				t.seek = append(t.seek, seekPoint{ts: b.ts, pos: w.clusterPos, frames: st.frames})
+				seekBudget--
+			case t.Type == TrackAudio && st.cluster != w.clusterPos:
+				st.cluster = w.clusterPos
+				if b.key {
+					t.seek = append(t.seek, seekPoint{ts: b.ts, pos: w.clusterPos, frames: st.frames})
+					seekBudget--
+				}
+			}
 		}
+		st.frames += int64(b.laced) + 1
 	}
 	if perr != nil {
 		return nil, perr

@@ -36,7 +36,15 @@ type PacketReader struct {
 	seeking   bool
 	seekTrack uint64
 	seekTS    int64
+	passed    int64
 }
+
+// Passed returns how many frames of the track a reader from NewReaderAt or
+// NewReaderAtFrame was positioned for come before its first: 0 for a reader
+// that starts at the beginning. Audio whose packets all hold the same number
+// of samples can be placed by it to the sample, which block timestamps,
+// rounded to the millisecond as a rule, cannot do.
+func (pr *PacketReader) Passed() int64 { return pr.passed }
 
 // NewReader returns a reader positioned at the first cluster. Readers are
 // independent; each may be used from one goroutine.
@@ -55,19 +63,37 @@ func (f *File) NewReaderContext(ctx context.Context) *PacketReader {
 	}}
 }
 
-// NewReaderAt returns a reader that starts at the last keyframe of a video
-// track presented at or before t, so that a decoder need not start from the
-// beginning of the file. The keyframes come from Open's scan of every Cluster
-// rather than from Cues, which files written live lack and which may list
-// only some keyframes.
+// NewReaderAt returns a reader that starts at the last place a decoder of
+// the track can start that is presented at or before t, so that a decoder
+// need not start from the beginning of the file. For a video track that is
+// a keyframe; for an audio track, the first block it has in a Cluster. The
+// places come from Open's scan of every Cluster rather than from Cues, which
+// files written live lack and which may list only some keyframes.
 //
-// Reading starts at the Cluster that holds the keyframe. The packets of the
-// track that precede the keyframe there belong to earlier groups of pictures
-// and are skipped, so the first packet of the track is the keyframe; the
-// other tracks are read from the start of the Cluster. ok is false when the
-// scan found no keyframe at or before t; the reader then starts at the first
+// Reading starts at the Cluster that holds the block. The packets of the
+// track that precede it there (the end of an earlier group of pictures) are
+// skipped, so the first packet of the track is the one sought; the other
+// tracks are read from the start of the Cluster. ok is false when the scan
+// found no such place at or before t; the reader then starts at the first
 // Cluster, as NewReaderContext's does.
 func (f *File) NewReaderAt(ctx context.Context, track uint64, t time.Duration) (pr *PacketReader, ok bool) {
+	// The places come in presentation order in any sane file; stopping at
+	// the first one past t keeps an out-of-order index safe, since starting
+	// early only costs time.
+	return f.readerAt(ctx, track, func(p seekPoint) bool { return f.ticks(p.ts) > t })
+}
+
+// NewReaderAtFrame is NewReaderAt for a place given by count, not by time:
+// the reader starts at the last place a decoder of the track can start that
+// has at most n of the track's frames before it. Passed then tells how many
+// those are.
+func (f *File) NewReaderAtFrame(ctx context.Context, track uint64, n int64) (pr *PacketReader, ok bool) {
+	return f.readerAt(ctx, track, func(p seekPoint) bool { return p.frames > n })
+}
+
+// readerAt returns a reader that starts at the last seek point of the track
+// before the first that is past what is sought.
+func (f *File) readerAt(ctx context.Context, track uint64, past func(seekPoint) bool) (pr *PacketReader, ok bool) {
 	pr = f.NewReaderContext(ctx)
 	tr := f.byNum[track]
 	if tr == nil {
@@ -75,10 +101,7 @@ func (f *File) NewReaderAt(ctx context.Context, track uint64, t time.Duration) (
 	}
 	var at *seekPoint
 	for i := range tr.seek {
-		// Keyframes come in presentation order in any sane file; stopping
-		// at the first one past t keeps an out-of-order index safe, since
-		// starting early only costs time.
-		if f.ticks(tr.seek[i].ts) > t {
+		if past(tr.seek[i]) {
 			break
 		}
 		at = &tr.seek[i]
@@ -87,7 +110,7 @@ func (f *File) NewReaderAt(ctx context.Context, track uint64, t time.Duration) (
 		return pr, false
 	}
 	pr.w.pos = at.pos
-	pr.seeking, pr.seekTrack, pr.seekTS = true, track, at.ts
+	pr.seeking, pr.seekTrack, pr.seekTS, pr.passed = true, track, at.ts, at.frames
 	return pr, true
 }
 

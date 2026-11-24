@@ -476,7 +476,10 @@ func TestNewReaderAt(t *testing.T) {
 		{1, 299 * ms, true, "f5", "a1"},
 		{1, 300 * ms, true, "f8", ""},
 		{1, time.Hour, true, "f8", ""},
-		{2, time.Hour, false, "f0", "a0"}, // audio is not indexed
+		{2, 0, true, "f0", "a0"}, // audio starts with a Cluster, at its first block there
+		{2, 109 * ms, true, "f0", "a0"},
+		{2, 110 * ms, true, "f2", "a1"},
+		{2, time.Hour, true, "f2", "a1"},  // not at a2, the second block of the Cluster
 		{9, time.Hour, false, "f0", "a0"}, // no such track
 	} {
 		pr, ok := f.NewReaderAt(context.Background(), c.track, c.at)
@@ -503,8 +506,49 @@ func TestNewReaderAt(t *testing.T) {
 			t.Errorf("track %d at %v: ok=%v video %q audio %q, want %v %q %q",
 				c.track, c.at, ok, name(video), name(audio), c.ok, c.video, c.audio)
 		}
-		if ok && (video == nil || !video.Keyframe || video.Timestamp > c.at) {
-			t.Errorf("track %d at %v: reading starts at %+v, want a keyframe at or before the time", c.track, c.at, video)
+		first := video
+		if c.track == 2 {
+			first = audio
+		}
+		if ok && (first == nil || !first.Keyframe || first.Timestamp > c.at) {
+			t.Errorf("track %d at %v: reading starts at %+v, want a keyframe at or before the time", c.track, c.at, first)
+		}
+	}
+
+	// By count: the last place with no more than so many frames of the
+	// track before it, and how many those are.
+	for _, c := range []struct {
+		track     uint64
+		n, passed int64
+		ok        bool
+		first     string
+	}{
+		{1, 0, 0, true, "f0"},
+		{1, 2, 0, true, "f0"},
+		{1, 3, 3, true, "f3"},
+		{1, 5, 5, true, "f5"},
+		{1, 7, 5, true, "f5"},
+		{1, 100, 8, true, "f8"},
+		{2, 0, 0, true, "a0"},
+		{2, 1, 1, true, "a1"},
+		{2, 100, 1, true, "a1"},
+		{9, 100, 0, false, ""},
+	} {
+		pr, ok := f.NewReaderAtFrame(context.Background(), c.track, c.n)
+		first := ""
+		for {
+			p, err := pr.Next()
+			if err != nil {
+				break
+			}
+			if p.Track == c.track {
+				first = string(p.Data)
+				break
+			}
+		}
+		if ok != c.ok || pr.Passed() != c.passed || first != c.first {
+			t.Errorf("track %d, at most %d frames in: ok=%v, %d passed, first %q; want %v, %d, %q",
+				c.track, c.n, ok, pr.Passed(), first, c.ok, c.passed, c.first)
 		}
 	}
 
@@ -540,9 +584,15 @@ func FuzzOpen(f *testing.F) {
 		}
 		for _, tr := range mf.Tracks[:min(len(mf.Tracks), 4)] {
 			pr, _ := mf.NewReaderAt(context.Background(), tr.Number, mf.Duration/2)
-			for i := 0; i < 1000; i++ {
-				if _, err := pr.Next(); err == io.EOF {
-					break
+			byCount, _ := mf.NewReaderAtFrame(context.Background(), tr.Number, tr.Frames/2)
+			if n := byCount.Passed(); n < 0 || n > tr.Frames/2 {
+				t.Fatalf("track %d of %d frames: a seek to frame %d passed %d", tr.Number, tr.Frames, tr.Frames/2, n)
+			}
+			for _, pr := range []*PacketReader{pr, byCount} {
+				for i := 0; i < 1000; i++ {
+					if _, err := pr.Next(); err == io.EOF {
+						break
+					}
 				}
 			}
 		}

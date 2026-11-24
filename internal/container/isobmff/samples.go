@@ -239,7 +239,9 @@ func (t *Track) finishStats() {
 }
 
 // SampleIter walks a track's samples in decode order: first the sample
-// tables, then any movie fragments.
+// tables, then any movie fragments. Its value may be copied: the copy goes
+// on from the same sample independently, which is how a caller looks ahead
+// or returns to a sample it has passed.
 type SampleIter struct {
 	t *Track
 	n int64 // table sample count

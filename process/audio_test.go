@@ -411,3 +411,33 @@ func TestCrossfade(t *testing.T) {
 		t.Errorf("no length: %v, want the outgoing track untouched", o[0])
 	}
 }
+
+// TestResamplerStartAt checks that a conversion begun partway through a signal
+// gives the output frames a conversion of the whole signal gives there.
+func TestResamplerStartAt(t *testing.T) {
+	for _, rates := range [][2]int{{44100, 48000}, {22050, 48000}, {96000, 48000}, {8000, 48000}, {48000, 48000}} {
+		in := make([]float32, 2*rates[0]) // a second of stereo
+		for i := range in {
+			f := 300.0 + 200*float64(i%2)
+			in[i] = float32(0.5 * math.Sin(2*math.Pi*f*float64(i/2)/float64(rates[0])))
+		}
+		whole := NewResampler(rates[0], rates[1], 2)
+		want := append(whole.Process(in), whole.Flush()...)
+		for _, at := range []int64{1, 1024, 7 * 1024, int64(rates[0])/2 + 1} {
+			r := NewResampler(rates[0], rates[1], 2)
+			first := r.StartAt(at)
+			got := append(r.Process(in[2*at:]), r.Flush()...)
+			if int64(len(want)) != 2*first+int64(len(got)) {
+				t.Fatalf("%d to %d from frame %d: output starts at frame %d and has %d, of %d",
+					rates[0], rates[1], at, first, len(got)/2, len(want)/2)
+			}
+			// The filter reaches back before the start for the first frames.
+			const settle = 2 * 512
+			for i := settle; i < len(got); i++ {
+				if d := math.Abs(float64(got[i] - want[2*int(first)+i])); d > 1e-6 {
+					t.Fatalf("%d to %d from frame %d: output frame %d differs by %g", rates[0], rates[1], at, int(first)+i/2, d)
+				}
+			}
+		}
+	}
+}
