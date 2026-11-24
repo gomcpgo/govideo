@@ -142,3 +142,31 @@ func BenchmarkSplitPairs(b *testing.B) {
 		}
 	})
 }
+
+func TestBlend(t *testing.T) {
+	const one = 1 << BlendShift
+	a, b := make([]byte, 256*256), make([]byte, 256*256)
+	for i := range a {
+		a[i], b[i] = byte(i>>8), byte(i)
+	}
+	dst := make([]byte, len(a))
+	for _, w := range []int32{0, 1, one / 3, one / 2, one - 1, one} {
+		Blend(dst, a, b, w)
+		for i, v := range dst {
+			av, bv := int(a[i]), int(b[i])
+			// Rounded to nearest, halves upwards.
+			want := (av*(one-int(w)) + bv*int(w) + one/2) >> BlendShift
+			if int(v) != want {
+				t.Fatalf("weight %d: blend(%d, %d) = %d, want %d", w, av, bv, v, want)
+			}
+		}
+		for c := 0; c < 256; c += 51 {
+			BlendTo(dst[:256], b[:256], byte(c), w)
+			for i, v := range dst[:256] {
+				if want := (i*(one-int(w)) + c*int(w) + one/2) >> BlendShift; int(v) != want {
+					t.Fatalf("weight %d: blend(%d, constant %d) = %d, want %d", w, i, c, v, want)
+				}
+			}
+		}
+	}
+}

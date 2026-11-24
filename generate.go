@@ -60,6 +60,12 @@ type GenerateOptions struct {
 	Tone     float64
 	ToneGain float64 // linear amplitude; default 0.25
 	Beep     bool
+
+	// FadeIn and FadeOut fade the picture from and to the canvas background,
+	// and the tone from and to silence, at the start and end of the segment.
+	FadeIn, FadeOut time.Duration
+	// Transition is how the segment replaces the one before it.
+	Transition Transition
 }
 
 // AddGenerated appends a synthesised segment lasting d: a test pattern, a

@@ -44,16 +44,83 @@ const (
 	DeinterlaceBottomFirst
 )
 
+// TransitionType selects how one segment gives way to the next.
+type TransitionType int
+
+const (
+	// Crossfade dissolves the picture of the outgoing segment into that of
+	// the incoming one, and fades the sound of the first out as the sound of
+	// the second comes in.
+	Crossfade TransitionType = iota
+)
+
+// Transition joins a segment to the one before it on the timeline. It is
+// set on the incoming segment. The zero value is a plain cut.
+//
+// For Duration the two segments are shown together: the incoming segment
+// starts that long before the outgoing one ends, so each transition makes
+// the timeline shorter by its Duration, and the material it mixes is the end
+// of one segment and the start of the other, nothing beyond what a cut
+// would have shown. A segment must be at least as long as the transitions at
+// its two ends together; the first segment has no transition.
+//
+// The pictures are mixed in proportion to the time elapsed. The sounds are
+// mixed with equal-power gains, which keep the loudness of two unrelated
+// sounds even through the join.
+type Transition struct {
+	Type     TransitionType
+	Duration time.Duration // 0 for a cut
+}
+
 // ClipOptions configures a clip added with AddClip.
 type ClipOptions struct {
 	Trim        TimeRange       // part of the source to use; the zero value uses all of it
 	Mute        bool            // drop the clip's own audio
 	Gain        float64         // linear gain for the clip's audio; 0 means 1.0
 	Deinterlace DeinterlaceMode // how interlaced video is handled; the zero value follows the stream
+
+	// FadeIn and FadeOut are how long the clip takes to appear at its start
+	// and to disappear at its end: the picture fades from and to the canvas
+	// background and the clip's sound from and to silence, both in
+	// proportion to the time elapsed. Fades take place within the clip and
+	// do not change its length. For one segment dissolving into the next
+	// use Transition.
+	FadeIn, FadeOut time.Duration
+	// Transition is how the clip replaces the segment before it.
+	Transition Transition
+}
+
+// Placement says where a picture sits on the canvas, relative to where the
+// canvas's Fit mode puts it. The zero value leaves it there.
+type Placement struct {
+	// Scale magnifies the fitted picture about its centre: 1.2 shows it a
+	// fifth larger, so that its edges pass out of view (or, where it did not
+	// fill the canvas, so that it fills more of it), and 0.5 shows it at
+	// half size with the background around it. 0 means 1.
+	Scale float64
+	// X and Y move the picture's centre away from the centre of the canvas,
+	// as fractions of the canvas width and height: X 0.1 puts it a tenth of
+	// the canvas width to the right, Y -0.1 a tenth of the height up.
+	X, Y float64
 }
 
 // ImageOptions configures a still image added with AddImage.
-type ImageOptions struct{}
+type ImageOptions struct {
+	// From and To move the picture while it is shown, the pan and zoom often
+	// called the Ken Burns effect: it starts at the placement From and goes
+	// at a steady rate to the placement To, which it reaches as the image
+	// ends. To{Scale: 1.15} is a slow zoom in; From{Scale: 1.2, X: 0.1} with
+	// To{Scale: 1.2, X: -0.1} pans from the left of the picture to the right.
+	// With both left zero the picture stays as the Fit mode places it; with
+	// the two equal it stays at that placement.
+	From, To Placement
+
+	// FadeIn and FadeOut fade the picture from and to the canvas background
+	// at the start and end of the time it is shown, within that time.
+	FadeIn, FadeOut time.Duration
+	// Transition is how the image replaces the segment before it.
+	Transition Transition
+}
 
 // AudioMode says how an added audio file joins the output.
 type AudioMode int
@@ -119,6 +186,18 @@ type item struct {
 	clip  ClipOptions
 	image ImageOptions
 	gen   GenerateOptions
+}
+
+// joining returns the fades and the transition of the item, which every
+// kind of segment has.
+func (it item) joining() (fadeIn, fadeOut time.Duration, tr Transition) {
+	switch it.kind {
+	case itemImage:
+		return it.image.FadeIn, it.image.FadeOut, it.image.Transition
+	case itemGenerated:
+		return it.gen.FadeIn, it.gen.FadeOut, it.gen.Transition
+	}
+	return it.clip.FadeIn, it.clip.FadeOut, it.clip.Transition
 }
 
 // label names the item in error messages.
