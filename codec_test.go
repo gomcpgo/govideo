@@ -52,7 +52,7 @@ func transcode(t *testing.T, src, dst string, trim govideo.TimeRange, o govideo.
 	t.Helper()
 	tl := govideo.NewTimeline(govideo.Canvas{Width: cardW, Height: cardH, FrameRate: govideo.R(cardFPS, 1)})
 	tl.AddClip(src, govideo.ClipOptions{Trim: trim})
-	if err := tl.Export(context.Background(), dst, o); err != nil {
+	if err := retryOnVM(t, func() error { return tl.Export(context.Background(), dst, o) }); err != nil {
 		t.Fatalf("Export %s from %s: %v", filepath.Base(dst), filepath.Base(src), err)
 	}
 }
@@ -451,7 +451,9 @@ func TestConcatMixedCodecs(t *testing.T) {
 	tl.AddClip(p("green.mov"), govideo.ClipOptions{})
 	tl.AddClip(p("blue.mp4"), govideo.ClipOptions{})
 	out := p("out.mp4")
-	if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileCompatible}); err != nil {
+	if err := retryOnVM(t, func() error {
+		return tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileCompatible})
+	}); err != nil {
 		t.Fatal(err)
 	}
 	frames := oracle.Frames(t, out, cardW, cardH)

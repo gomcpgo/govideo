@@ -396,6 +396,7 @@ func (d *vtDecoder) Decode(p []byte, pts time.Duration) ([]codec.TimedPicture, e
 	}
 	if err != nil {
 		d.failed = true
+		stats.failures.Add(1)
 	}
 	d.mu.Lock()
 	delete(d.pending, tag)
