@@ -18,6 +18,7 @@ import (
 	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
+	"github.com/gomcpgo/govideo/internal/container/mp3"
 	"github.com/gomcpgo/govideo/internal/container/wav"
 )
 
@@ -28,13 +29,13 @@ var ErrUnknownFormat = errors.New("videoprobe: unrecognised container format")
 // not one this package reads. errors.Is(err, ErrUnknownFormat) is true for
 // it, so callers that only ask "can this be probed" need no change.
 type UnsupportedFormatError struct {
-	// Format is a short name: "mp3", "flac", "ogg", "ac3", "adts", "mpegts",
-	// "mxf", "heif", "asf" or "flv".
+	// Format is a short name: "flac", "ogg", "ac3", "adts", "mpegts", "mxf",
+	// "heif", "asf" or "flv".
 	Format string
 }
 
 var unsupportedNames = map[string]string{
-	"mp3": "MP3", "flac": "FLAC", "ogg": "Ogg", "ac3": "raw AC-3", "adts": "raw AAC (ADTS)",
+	"flac": "FLAC", "ogg": "Ogg", "ac3": "raw AC-3", "adts": "raw AAC (ADTS)",
 	"mpegts": "MPEG transport stream", "mxf": "MXF", "heif": "HEIF/HEIC/AVIF image", "asf": "ASF/WMV", "flv": "FLV",
 }
 
@@ -67,8 +68,6 @@ func sniffUnsupported(head []byte, r io.ReaderAt) string {
 		return "flac"
 	case has(0, "OggS"):
 		return "ogg"
-	case has(0, "ID3"):
-		return "mp3"
 	case has(0, "FLV\x01"):
 		return "flv"
 	case has(0, "\x30\x26\xb2\x75\x8e\x66\xcf\x11"):
@@ -83,8 +82,6 @@ func sniffUnsupported(head []byte, r io.ReaderAt) string {
 		return "mpegts" // 192-byte packets (M2TS, AVCHD)
 	case len(head) >= 2 && head[0] == 0xff && head[1]&0xf6 == 0xf0:
 		return "adts"
-	case len(head) >= 2 && head[0] == 0xff && head[1]&0xe0 == 0xe0 && head[1]&0x06 != 0:
-		return "mp3"
 	}
 	return ""
 }
@@ -121,7 +118,7 @@ func (k Kind) String() string {
 
 // Info describes a media file.
 type Info struct {
-	Format     string // "mp4", "mov", "matroska", "webm", "wav", "avi"
+	Format     string // "mp4", "mov", "matroska", "webm", "wav", "avi", "mp3"
 	Duration   time.Duration
 	StartTime  time.Duration
 	BitRate    int64 // bits per second, overall
@@ -243,6 +240,17 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 			return nil, err
 		}
 		info = fromISOBMFF(f)
+	case mp3.Sniff(head):
+		// Last: an ID3 tag or twelve set bits say little, and Open looks
+		// for the frames themselves.
+		f, err := mp3.Open(ctx, r, size)
+		if errors.Is(err, mp3.ErrNotMP3) {
+			return nil, notMP3(r, size)
+		}
+		if err != nil {
+			return nil, err
+		}
+		info = fromMP3(f)
 	default:
 		if f := sniffUnsupported(head, r); f != "" {
 			return nil, &UnsupportedFormatError{Format: f}
@@ -257,6 +265,21 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 		info.Streams[i].Index = i
 	}
 	return info, nil
+}
+
+// notMP3 is the error for a file that starts like an MPEG audio file and
+// holds no frames. ID3 tags are also put in front of other audio (raw AAC,
+// FLAC), so what follows them is looked at.
+func notMP3(r io.ReaderAt, size int64) error {
+	if off := mp3.SkipTags(r, size); off > 0 && off < size {
+		rest := io.NewSectionReader(r, off, size-off)
+		head := make([]byte, 64)
+		n, _ := rest.ReadAt(head, 0)
+		if f := sniffUnsupported(head[:n], rest); f != "" {
+			return &UnsupportedFormatError{Format: f}
+		}
+	}
+	return ErrUnknownFormat
 }
 
 // --- helpers ----------------------------------------------------------------

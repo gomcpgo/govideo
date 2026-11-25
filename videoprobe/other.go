@@ -9,6 +9,7 @@ import (
 	"github.com/gomcpgo/govideo/internal/codechdr"
 	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
+	"github.com/gomcpgo/govideo/internal/container/mp3"
 	"github.com/gomcpgo/govideo/internal/container/wav"
 )
 
@@ -208,6 +209,22 @@ func fromWAV(f *wav.File) *Info {
 			ChannelLayout: defaultLayout(f.Channels)},
 	}
 	return &Info{Format: "wav", Duration: s.Duration, Tags: map[string]string{}, Streams: []Stream{s}}
+}
+
+// fromMP3 describes a bare MPEG audio file. The duration is that of the
+// audio: the samples of every frame, less the encoder's delay and padding
+// where the file states them.
+func fromMP3(f *mp3.File) *Info {
+	rate := int64(f.SampleRate)
+	s := Stream{
+		Kind: Audio, Codec: f.Codec, TimeBase: Rational{1, rate}, Frames: f.Frames, Default: true,
+		Duration: ticks(f.Samples(), rate), BitRate: int64(f.BitRate),
+		Audio: &AudioInfo{SampleRate: f.SampleRate, Channels: f.Channels, ChannelLayout: defaultLayout(f.Channels)},
+	}
+	if total := f.Frames * int64(f.FrameSamples); f.VBR && total > 0 {
+		s.BitRate = int64(float64(f.DataSize) * 8 * float64(rate) / float64(total)) // the mean
+	}
+	return &Info{Format: "mp3", Duration: s.Duration, Tags: map[string]string{}, Streams: []Stream{s}}
 }
 
 // aviVideoCodecs maps upper-cased video fourccs (biCompression, else the
