@@ -27,10 +27,24 @@ js, _ := info.JSON() // field names close to `ffprobe -show_format -show_streams
 
 | | Supported |
 |---|---|
-| Containers | MP4, MOV, 3GP, fragmented MP4, Matroska, WebM (including files with no duration or cues), AVI, WAV |
+| Containers | MP4, MOV, 3GP, fragmented MP4, Matroska, WebM (including files with no duration or cues), AVI, WAV, MP3 |
 | Video headers | H.264, HEVC, AV1, VP8, VP9; ProRes and Motion JPEG are identified |
 | Audio headers | AAC (LC, HE-AAC, HE-AACv2), Opus, FLAC, MP3, ALAC, LPCM |
 | Reported | duration, start time, frame rate, variable-frame-rate flag, coded and display size, aspect ratio, rotation, bit depth, chroma format, colour tags, HLG/PQ, Dolby Vision configuration, sample rate, channels, language, faststart, fragmentation, tags |
+
+An MP3 file's length comes from the Xing, Info or VBRI header that most encoders write, less the encoder's delay and padding where the file states them. A file with no such header is measured by reading every frame header, which gives the exact length of a variable-rate file at the cost of reading it through. (ffprobe estimates such a file from its bit rate, so the two can disagree; `videoprobe`'s figure is the one the file decodes to.)
+
+## One picture from a video: `govideo.Frame`
+
+```go
+img, err := govideo.Frame(ctx, "clip.mp4", govideo.FrameOptions{
+    At:    2 * time.Second, // past the end gives the last frame
+    Width: 320,             // the height follows; leave both zero for the full size
+})
+// img is an *image.RGBA: encode it with image/jpeg or image/png.
+```
+
+`Frame` decodes the picture on screen at a given time, for a thumbnail or a poster frame. It starts from the sync sample before that time, so a frame late in a long file costs no more than an early one. The picture comes out upright (the file's rotation is applied) and with square pixels. It reads the same files and codecs as clips do, with the same platform limits: H.264 and HEVC on macOS only for now, Motion JPEG everywhere.
 
 ## Building a video: `govideo`
 
@@ -78,7 +92,7 @@ What works today:
 
 Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; deinterlacing rebuilds each field on its own, so a stream marked interlaced whose pictures are not loses vertical detail (set `ClipOptions.Deinterlace` to `DeinterlaceOff` for such a clip, or to a field order for an interlaced stream that is not marked); H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
-Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
+Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A bare MP3 file is one of these for now: `videoprobe` reads it, but there is no MP3 decoder yet. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
 ## Codec policy
 
@@ -96,7 +110,7 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |
