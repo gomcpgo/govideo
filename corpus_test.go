@@ -404,37 +404,44 @@ func corpusStills(t *testing.T, dir string) {
 	for _, in := range corpusFiles(t, dir) {
 		name := filepath.Base(in)
 		t.Run(name, func(t *testing.T) {
-			// A background that is neither black nor white, so transparent
-			// images are told apart from ones composited over either.
-			tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1),
-				Background: color.NRGBA{32, 64, 192, 255}})
-			tl.AddImage(in, time.Second, govideo.ImageOptions{})
-			out := filepath.Join(tmp, name+".mov")
-			if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
-				t.Fatalf("export: %v", err)
-			}
-			defer os.Remove(out)
-			// Both pictures go to RGB at full size before they are reduced.
-			// Reduced as 4:2:0, a thumbnail has one chroma sample for every
-			// 20x20 pixels of the picture, which smears a saturated edge (a
-			// cut-out on the coloured background) differently on each side.
-			ours := thumbs(t, "format=gbrp,", "-i", out)
-			if len(ours) != 30 {
-				t.Fatalf("%d frames, want 30", len(ours))
-			}
-			// The oracle lays the image over the same background, at the even
-			// offsets Fit uses; for an opaque image that is just the padding.
-			raw := oracle.FFmpegOutput(t, "-f", "lavfi", "-i", "color=c=0x2040C0:s=640x360", "-i", in, "-filter_complex",
-				"[1:v]scale=640:360:force_original_aspect_ratio=decrease[fg];[0:v][fg]overlay=trunc((W-w)/4)*2:trunc((H-h)/4)*2:format=auto,format=gbrp,scale=64:36",
-				"-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
-			if len(raw) != len(ours[0]) {
-				t.Fatal("the oracle cannot read the image")
-			}
-			if p := psnr(ours[0], raw); p < 32 {
+			if p := stillPSNR(t, in, filepath.Join(tmp, name+".mov")); p < 32 {
 				t.Errorf("picture differs from the oracle's (PSNR %.1f dB): wrong orientation, colour or transparency", p)
 			}
 		})
 	}
+}
+
+// stillPSNR exports the still at in for a second, to out (removed again),
+// and returns how near its picture is to the oracle's reading of the same
+// file, in dB, both reduced to thumbnails.
+func stillPSNR(t *testing.T, in, out string) float64 {
+	t.Helper()
+	// A background that is neither black nor white, so transparent
+	// images are told apart from ones composited over either.
+	tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1),
+		Background: color.NRGBA{32, 64, 192, 255}})
+	tl.AddImage(in, time.Second, govideo.ImageOptions{})
+	if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	defer os.Remove(out)
+	// Both pictures go to RGB at full size before they are reduced.
+	// Reduced as 4:2:0, a thumbnail has one chroma sample for every
+	// 20x20 pixels of the picture, which smears a saturated edge (a
+	// cut-out on the coloured background) differently on each side.
+	ours := thumbs(t, "format=gbrp,", "-i", out)
+	if len(ours) != 30 {
+		t.Fatalf("%d frames, want 30", len(ours))
+	}
+	// The oracle lays the image over the same background, at the even
+	// offsets Fit uses; for an opaque image that is just the padding.
+	raw := oracle.FFmpegOutput(t, "-f", "lavfi", "-i", "color=c=0x2040C0:s=640x360", "-i", in, "-filter_complex",
+		"[1:v]scale=640:360:force_original_aspect_ratio=decrease[fg];[0:v][fg]overlay=trunc((W-w)/4)*2:trunc((H-h)/4)*2:format=auto,format=gbrp,scale=64:36",
+		"-frames:v", "1", "-pix_fmt", "rgb24", "-f", "rawvideo", "-")
+	if len(raw) != len(ours[0]) {
+		t.Fatal("the oracle cannot read the image")
+	}
+	return psnr(ours[0], raw)
 }
 
 func corpusUnsupported(t *testing.T, dir string) {
