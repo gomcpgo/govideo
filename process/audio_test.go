@@ -169,6 +169,24 @@ func TestResamplerChunkIndependence(t *testing.T) {
 	}
 }
 
+func TestStereoToMono(t *testing.T) {
+	// Each frame becomes the mean of its channels; a trailing half frame
+	// is dropped; what is in dst is kept.
+	got := StereoToMono([]float32{9}, []float32{0.5, 0.5, 1, -1, 0.75, 0, -1, -1, 0.25})
+	want := []float32{9, 0.5, 0, 0.375, -1}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("sample %d is %v, want %v", i, got[i], want[i])
+		}
+	}
+	if got := StereoToMono(nil, nil); len(got) != 0 {
+		t.Errorf("nothing in: %v", got)
+	}
+}
+
 func TestToStereo(t *testing.T) {
 	if got := ToStereo([]float32{0.1, 0.2}, 1); len(got) != 4 || got[0] != 0.1 || got[1] != 0.1 || got[3] != 0.2 {
 		t.Errorf("mono: %v", got)

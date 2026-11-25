@@ -66,6 +66,18 @@ func ToStereo(in []float32, channels int) []float32 {
 	return out
 }
 
+// StereoToMono appends the mono mix of interleaved stereo to dst and returns
+// it: each frame becomes the mean of its two channels. A sound that is the
+// same on both, as speech nearly always is, keeps its level, and the mix
+// cannot exceed full scale; a sound on one channel alone comes out 6 dB
+// lower.
+func StereoToMono(dst, in []float32) []float32 {
+	for i := 0; i+1 < len(in); i += 2 {
+		dst = append(dst, (in[i]+in[i+1])*0.5)
+	}
+	return dst
+}
+
 // ApplyGain multiplies every sample by gain.
 func ApplyGain(s []float32, gain float32) {
 	if gain == 1 {

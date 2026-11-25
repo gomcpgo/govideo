@@ -150,6 +150,63 @@ func FuzzOpen(f *testing.F) {
 	})
 }
 
+// TestMuxAudioOnly writes an audio file as an audio-only export does: the
+// M4A brand, and the movie's lengths in samples, so that the edit which
+// cuts an encoder's priming also ends the track on the sample.
+func TestMuxAudioOnly(t *testing.T) {
+	const rate, priming, programme = 16000, 2127, 30001
+	m := NewMuxer(BrandM4A, &memFile{})
+	m.SetMovieTimescale(0) // ignored
+	m.SetMovieTimescale(rate)
+	a := m.AddTrack(TrackConfig{Handler: "soun", Timescale: rate, Entry: AudioEntry("mp4a", 1, 16, rate, ESDS(0x40, 0x05, []byte{0x14, 0x08}, 0, 24000, 24000))})
+	for i := 0; i < 32; i++ { // 32768 samples: the priming, the programme, and padding
+		if err := m.WriteSample(a, []byte{byte(i), 1, 2}, 1024, true, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m.SetEdit(a, priming, programme)
+	var out bytes.Buffer
+	if err := m.Finish(&out); err != nil {
+		t.Fatal(err)
+	}
+	data := out.Bytes()
+	if string(data[4:12]) != "ftypM4A " || string(data[16:28]) != "M4A mp42isom" {
+		t.Errorf("file type box % q, want the M4A brand with mp42 and isom", data[4:28])
+	}
+	f, err := Open(context.Background(), bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.MajorBrand != "M4A " || f.QuickTime || !f.FastStart || len(f.Tracks) != 1 {
+		t.Fatalf("brand %q QuickTime=%v FastStart=%v tracks=%d", f.MajorBrand, f.QuickTime, f.FastStart, len(f.Tracks))
+	}
+	tr := f.Tracks[0]
+	if f.Timescale != rate || f.Duration != programme || tr.TkhdDuration != programme || tr.MediaDuration != 32*1024 {
+		t.Errorf("movie %d units of 1/%d, track %d, media %d: want %d of 1/%d, %d and %d",
+			f.Duration, f.Timescale, tr.TkhdDuration, tr.MediaDuration, programme, rate, programme, 32*1024)
+	}
+	if len(tr.Edits) != 1 || tr.Edits[0].MediaTime != priming || tr.Edits[0].SegmentDuration != programme {
+		t.Errorf("edits %+v, want one from media time %d for %d", tr.Edits, priming, programme)
+	}
+
+	// Left alone, the lengths are in milliseconds, to the nearest.
+	m = NewMuxer(BrandMP4, &memFile{})
+	a = m.AddTrack(TrackConfig{Handler: "soun", Timescale: rate, Entry: AudioEntry("sowt", 1, 16, rate), SampleSize: 2})
+	if err := m.WriteSample(a, make([]byte, 2*programme), 0, true, 0); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if err := m.Finish(&out); err != nil {
+		t.Fatal(err)
+	}
+	if f, err = Open(context.Background(), bytes.NewReader(out.Bytes()), int64(out.Len())); err != nil {
+		t.Fatal(err)
+	}
+	if f.Timescale != 1000 || f.Duration != 1875 {
+		t.Errorf("movie %d units of 1/%d, want 1875 ms", f.Duration, f.Timescale)
+	}
+}
+
 // TestMuxReorderedSamples writes a B-frame stream: samples in decode order,
 // some shown before their decode position. The offsets must come back
 // non-negative, with an edit that starts the presentation at the first
