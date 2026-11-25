@@ -25,14 +25,13 @@ type fixture struct {
 	hdr   string
 	frag  bool
 	noDur bool // ffprobe reports no duration (live WebM)
-	// ffprobe estimates the duration from the bit rate (an MP3 of variable
-	// rate with no Xing header): the length ffmpeg decodes is the measure.
+	// decoded marks a bare MP3, whose duration is compared with the length
+	// ffmpeg decodes it to, not with ffprobe's. ffprobe estimates a file of
+	// variable rate with no Xing header from its bit rate, and its duration
+	// of a file with a header depends on its version: 8.0 and later leave
+	// out the encoder's delay and padding that the header states, 6.1
+	// counts them in (2.088 s for two seconds at 16 kHz).
 	decoded bool
-	// length is the seconds of audio an MP3 with a Xing or Info header was
-	// made from, which is its duration. ffprobe's is not used: versions 8.0
-	// and 9.0 leave out the encoder's delay and padding that the header
-	// states, version 6.1 counts them in (2.088 s for two seconds at 16 kHz).
-	length float64
 }
 
 func lavfi(v, a string) []string {
@@ -89,12 +88,12 @@ var fixtures = []fixture{
 	{name: "mjpeg_pcm.avi", args: cat(lavfi(vsrc, asrc), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_s16le"})},
 	{name: "mjpeg_pcm_u8.avi", args: cat(lavfi(vsrc, "sine=f=440:d=2:r=11025"), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_u8", "-ac", "1"})},
 	{name: "mjpeg_ntsc_f32.avi", args: cat(lavfi("testsrc2=d=2:s=640x360:r=30000/1001", "sine=f=440:d=2:r=44100"), []string{"-c:v", "mjpeg", "-q:v", "5", "-c:a", "pcm_f32le", "-ac", "2"})},
-	{name: "cbr.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=44100"), []string{"-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"}), length: 2},
-	{name: "vbr.mp3", args: cat(lavfi("", "sine=f=440:d=3:r=48000"), []string{"-c:a", "libmp3lame", "-q:a", "4", "-ac", "2"}), length: 3},
-	{name: "bare.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=44100"), []string{"-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1", "-id3v2_version", "0", "-write_xing", "0"})},
+	{name: "cbr.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=44100"), []string{"-c:a", "libmp3lame", "-b:a", "128k", "-ac", "2"}), decoded: true},
+	{name: "vbr.mp3", args: cat(lavfi("", "sine=f=440:d=3:r=48000"), []string{"-c:a", "libmp3lame", "-q:a", "4", "-ac", "2"}), decoded: true},
+	{name: "bare.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=44100"), []string{"-c:a", "libmp3lame", "-b:a", "64k", "-ac", "1", "-id3v2_version", "0", "-write_xing", "0"}), decoded: true},
 	{name: "bare_vbr.mp3", args: cat(lavfi("", "sine=f=440:d=3:r=32000"), []string{"-c:a", "libmp3lame", "-q:a", "6", "-write_xing", "0", "-write_id3v1", "1"}), decoded: true},
-	{name: "mono16k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=16000"), []string{"-c:a", "libmp3lame", "-q:a", "4", "-ac", "1"}), length: 2},
-	{name: "8k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=8000"), []string{"-c:a", "libmp3lame", "-b:a", "16k", "-ac", "1", "-metadata", "title=a title"}), length: 2},
+	{name: "mono16k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=16000"), []string{"-c:a", "libmp3lame", "-q:a", "4", "-ac", "1"}), decoded: true},
+	{name: "8k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=8000"), []string{"-c:a", "libmp3lame", "-b:a", "16k", "-ac", "1", "-metadata", "title=a title"}), decoded: true},
 	{name: "layer2.mp2", args: cat(lavfi("", asrc), []string{"-c:a", "mp2", "-b:a", "128k", "-ac", "2"})},
 	{name: "prores.mov", args: cat(lavfi(vsrc, ""), []string{"-c:v", "prores_videotoolbox", "-profile:v", "hq"}), opt: true},
 }
@@ -121,12 +120,7 @@ func TestAgainstFFprobe(t *testing.T) {
 			want := oracle.FFprobe(t, path, "-count_packets")
 			if fx.decoded {
 				d := strconv.FormatFloat(float64(len(oracle.Audio(t, path, "0:a:0")))/48000, 'f', 6, 64)
-				t.Logf("ffprobe estimates %s s; ffmpeg decodes %s s", want.Format.Duration, d)
-				want.Format.Duration, want.Streams[0].Duration = d, d
-			}
-			if fx.length > 0 {
-				d := strconv.FormatFloat(fx.length, 'f', 6, 64)
-				t.Logf("ffprobe says %s s; the audio is %s s", want.Format.Duration, d)
+				t.Logf("ffprobe says %s s; ffmpeg decodes %s s", want.Format.Duration, d)
 				want.Format.Duration, want.Streams[0].Duration = d, d
 			}
 			got, err := videoprobe.ProbeFile(context.Background(), path)
