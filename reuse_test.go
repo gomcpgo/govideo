@@ -45,8 +45,11 @@ func exportCuts(t *testing.T, cuts []cut) (sessions, reused int64) {
 		}
 	}
 	out := filepath.Join(t.TempDir(), "out.mov")
-	before := oscodec.VideoDecoderStats()
-	if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+	var before oscodec.DecoderStats
+	if err := retryOnVM(t, func() error {
+		before = oscodec.VideoDecoderStats()
+		return tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	}); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
 	after := oscodec.VideoDecoderStats()
@@ -135,13 +138,15 @@ func TestDecoderReuse(t *testing.T) {
 		tl.AddClip(a, govideo.ClipOptions{})
 		tl.AddClip(b, govideo.ClipOptions{})
 		before := oscodec.VideoDecoderStats()
-		err := tl.Export(ctx, filepath.Join(t.TempDir(), "out.mov"), govideo.ExportOptions{
-			Profile: govideo.ProfileIntermediate,
-			Progress: func(p govideo.Progress) {
-				if p.Frame == 100 {
-					cancel()
-				}
-			}})
+		err := retryOnVM(t, func() error {
+			return tl.Export(ctx, filepath.Join(t.TempDir(), "out.mov"), govideo.ExportOptions{
+				Profile: govideo.ProfileIntermediate,
+				Progress: func(p govideo.Progress) {
+					if p.Frame == 100 {
+						cancel()
+					}
+				}})
+		})
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("Export: %v, want a cancellation", err)
 		}

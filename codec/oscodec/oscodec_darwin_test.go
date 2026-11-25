@@ -622,3 +622,35 @@ func TestCleanStart(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeFailures checks that a sample the decoder refuses is counted,
+// and that a session which has failed is not reused for another stream.
+func TestDecodeFailures(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	const w, h = 320, 240
+	_, cfg := encodeGradient(t, w, h, 0, 4, 10)
+	vc := VideoConfig{Codec: "h264", Width: w, Height: h, Record: cfg, Matrix: 1}
+	dec, err := NewVideoDecoder(vc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dec.Close()
+	before := VideoDecoderStats()
+	// A slice NAL unit of an IDR picture whose header is noise.
+	bad := []byte{0, 0, 0, 9, 0x65, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
+	pics, err := dec.Decode(bad, 0)
+	for _, p := range pics {
+		p.Picture.Release()
+	}
+	if err == nil {
+		t.Skip("the system decoder accepted a corrupt sample without an error")
+	}
+	if n := VideoDecoderStats().Failures - before.Failures; n != 1 {
+		t.Errorf("%d failures counted for one refused sample (%v)", n, err)
+	}
+	if dec.(Restarter).Restart(vc) {
+		t.Error("a session that failed was reused")
+	}
+}

@@ -44,7 +44,9 @@ func exportClip(t *testing.T, in string, fps int64, o govideo.ClipOptions) [][]b
 	out := filepath.Join(t.TempDir(), "out.mov")
 	tl := govideo.NewTimeline(govideo.Canvas{Width: cardW, Height: cardH, FrameRate: govideo.R(fps, 1)})
 	tl.AddClip(in, o)
-	if err := tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate}); err != nil {
+	if err := retryOnVM(t, func() error {
+		return tl.Export(context.Background(), out, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
+	}); err != nil {
 		t.Fatalf("Export from %s: %v", filepath.Base(in), err)
 	}
 	return oracle.Frames(t, out, cardW, cardH)

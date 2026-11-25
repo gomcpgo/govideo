@@ -50,13 +50,18 @@ type DecoderStats struct {
 	Sessions int64 // decoder sessions opened
 	Reused   int64 // streams decoded on the session of an earlier stream
 	Pictures int64 // decoded pictures handed out and not yet released
+	// Failures counts samples the system decoder could not decode, whether
+	// or not the caller went on: a stream trimmed between keyframes may
+	// fail on pictures before the cut and still export.
+	Failures int64
 }
 
-var stats struct{ sessions, reused, pictures atomic.Int64 }
+var stats struct{ sessions, reused, pictures, failures atomic.Int64 }
 
 // VideoDecoderStats returns the counts so far.
 func VideoDecoderStats() DecoderStats {
-	return DecoderStats{Sessions: stats.sessions.Load(), Reused: stats.reused.Load(), Pictures: stats.pictures.Load()}
+	return DecoderStats{Sessions: stats.sessions.Load(), Reused: stats.reused.Load(), Pictures: stats.pictures.Load(),
+		Failures: stats.failures.Load()}
 }
 
 // EncodeConfig describes an H.264 encode.
