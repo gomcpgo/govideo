@@ -432,6 +432,72 @@ var mpaBitrates = [5][16]int{
 	{0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160},         // MPEG-2/2.5 layer II, III
 }
 
+// MPEGAudioFrame is what the 4-byte header of an MPEG-1, 2 or 2.5 audio
+// frame (layers I to III) says about the frame.
+type MPEGAudioFrame struct {
+	Layer      int  // 1 to 3
+	LowRate    bool // MPEG-2 or 2.5: the half and quarter sample rates
+	Protected  bool // a 16-bit CRC follows the header
+	Mono       bool
+	SampleRate int
+	BitRate    int // bits per second; 0 for a free-format stream
+	Samples    int // sample frames in the frame
+	Size       int // bytes in the frame, header included; 0 for free format
+}
+
+// MPEGAudioFrameHeader decodes a frame header; ok is false where b does not
+// start with a valid one.
+func MPEGAudioFrameHeader(b []byte) (h MPEGAudioFrame, ok bool) {
+	if len(b) < 4 || b[0] != 0xff || b[1]&0xe0 != 0xe0 {
+		return h, false
+	}
+	version := b[1] >> 3 & 3 // 0 = 2.5, 2 = MPEG-2, 3 = MPEG-1
+	layerBits := b[1] >> 1 & 3
+	brIdx := int(b[2] >> 4)
+	srIdx := int(b[2] >> 2 & 3)
+	if version == 1 || layerBits == 0 || brIdx == 15 || srIdx == 3 {
+		return h, false
+	}
+	h.Layer = 4 - int(layerBits)
+	h.LowRate = version != 3
+	h.Protected = b[1]&1 == 0
+	h.Mono = b[3]>>6 == 3
+	h.SampleRate = [...]int{44100, 48000, 32000}[srIdx]
+	row := h.Layer - 1
+	switch version {
+	case 2:
+		h.SampleRate /= 2
+	case 0:
+		h.SampleRate /= 4
+	}
+	if h.LowRate {
+		row = 3
+		if h.Layer > 1 {
+			row = 4
+		}
+	}
+	h.BitRate = mpaBitrates[row][brIdx] * 1000
+	switch {
+	case h.Layer == 1:
+		h.Samples = 384
+	case h.Layer == 3 && h.LowRate:
+		h.Samples = 576
+	default:
+		h.Samples = 1152
+	}
+	if h.BitRate > 0 {
+		// A frame holds Samples/SampleRate seconds at BitRate, in slots of
+		// four bytes (layer I) or one; the padding bit adds a slot.
+		pad := int(b[2] >> 1 & 1)
+		if h.Layer == 1 {
+			h.Size = (h.Samples/32*h.BitRate/h.SampleRate + pad) * 4
+		} else {
+			h.Size = h.Samples/8*h.BitRate/h.SampleRate + pad
+		}
+	}
+	return h, true
+}
+
 // ParseMPEGAudioHeader parses a 4-byte MPEG-1/2/2.5 audio frame header
 // (layers I to III). BitRate is 0 for free-format streams.
 func ParseMPEGAudioHeader(b []byte) (*Audio, error) {
@@ -441,40 +507,13 @@ func ParseMPEGAudioHeader(b []byte) (*Audio, error) {
 	if b[0] != 0xff || b[1]&0xe0 != 0xe0 {
 		return nil, invalid("MPEG audio sync word")
 	}
-	version := b[1] >> 3 & 3 // 0 = 2.5, 2 = MPEG-2, 3 = MPEG-1
-	layerBits := b[1] >> 1 & 3
-	brIdx := int(b[2] >> 4)
-	srIdx := int(b[2] >> 2 & 3)
-	if version == 1 || layerBits == 0 || brIdx == 15 || srIdx == 3 {
+	h, ok := MPEGAudioFrameHeader(b)
+	if !ok {
 		return nil, invalid("MPEG audio header")
 	}
-	layer := 4 - int(layerBits)
-	a := &Audio{Codec: [...]string{"mp1", "mp2", "mp3"}[layer-1]}
-	a.SampleRate = [...]int{44100, 48000, 32000}[srIdx]
-	row := layer - 1
-	switch version {
-	case 2:
-		a.SampleRate /= 2
-	case 0:
-		a.SampleRate /= 4
-	}
-	if version != 3 {
-		row = 3
-		if layer > 1 {
-			row = 4
-		}
-	}
-	a.BitRate = mpaBitrates[row][brIdx] * 1000
-	switch {
-	case layer == 1:
-		a.FrameSize = 384
-	case layer == 3 && version != 3:
-		a.FrameSize = 576
-	default:
-		a.FrameSize = 1152
-	}
-	a.Channels, a.ChannelLayout = 2, "stereo"
-	if b[3]>>6 == 3 {
+	a := &Audio{Codec: [...]string{"mp1", "mp2", "mp3"}[h.Layer-1], SampleRate: h.SampleRate,
+		BitRate: h.BitRate, FrameSize: h.Samples, Channels: 2, ChannelLayout: "stereo"}
+	if h.Mono {
 		a.Channels, a.ChannelLayout = 1, "mono"
 	}
 	return a, nil

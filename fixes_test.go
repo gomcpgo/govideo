@@ -279,6 +279,20 @@ func TestUnsupportedInputErrors(t *testing.T) {
 	if err := export(func(tl *govideo.Timeline) { tl.AddClip(flac, govideo.ClipOptions{}) }); !errors.As(err, &cu) || cu.Codec != "flac" {
 		t.Errorf("FLAC file: %v, want ErrCodecUnavailable for flac", err)
 	}
+	// A bare MP3 is read by videoprobe, and has no decoder yet.
+	mp3 := filepath.Join(dir, "a.mp3")
+	oracle.FFmpeg(t, "-f", "lavfi", "-i", "sine=f=440:d=1", "-c:a", "libmp3lame", mp3)
+	for name, add := range map[string]func(*govideo.Timeline){
+		"clip": func(tl *govideo.Timeline) { tl.AddClip(mp3, govideo.ClipOptions{}) },
+		"audio": func(tl *govideo.Timeline) {
+			tl.AddGenerated(time.Second, govideo.GenerateOptions{})
+			tl.AddAudio(mp3, govideo.AudioOptions{})
+		},
+	} {
+		if err := export(add); !errors.As(err, &cu) || cu.Codec != "mp3" || cu.Reason == "" {
+			t.Errorf("MP3 file as %s: %v, want ErrCodecUnavailable for mp3", name, err)
+		}
+	}
 	ts := filepath.Join(dir, "a.ts")
 	oracle.FFmpeg(t, "-f", "lavfi", "-i", "testsrc2=d=1:s=160x120:r=25", "-c:v", "mpeg2video", "-f", "mpegts", ts)
 	if err := export(func(tl *govideo.Timeline) { tl.AddClip(ts, govideo.ClipOptions{}) }); !errors.As(err, &uf) || uf.Format != "mpegts" {

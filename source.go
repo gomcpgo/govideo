@@ -73,7 +73,7 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		// and is reported as one.
 		var uf *videoprobe.UnsupportedFormatError
 		if errors.As(err, &uf) {
-			if id, ok := map[string]CodecID{"mp3": "mp3", "flac": "flac", "ac3": "ac3"}[uf.Format]; ok {
+			if id, ok := map[string]CodecID{"flac": "flac", "ac3": "ac3"}[uf.Format]; ok {
 				if _, cerr := Available(id, Decode); cerr != nil {
 					return fail(cerr)
 				}
@@ -90,6 +90,12 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		m.wv, err = wav.Open(ctx, f, st.Size())
 	case "avi":
 		m.avi, err = avi.Open(ctx, f, st.Size())
+	case "mp3":
+		// videoprobe measures these files; nothing here reads their frames
+		// until there is a decoder for them.
+		if _, err = Available(CodecID(m.info.Streams[0].Codec), Decode); err == nil {
+			err = fmt.Errorf("unsupported container %q", m.info.Format)
+		}
 	default:
 		err = fmt.Errorf("unsupported container %q", m.info.Format)
 	}

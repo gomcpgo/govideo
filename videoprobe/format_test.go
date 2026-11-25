@@ -45,8 +45,8 @@ func TestUnsupportedFormats(t *testing.T) {
 	}{
 		{"flac", pad("fLaC\x00\x00\x00\x22")},
 		{"ogg", pad("OggS\x00\x02")},
-		{"mp3", pad("ID3\x04\x00\x00")},
-		{"mp3", pad("\xff\xfb\x90\x00")},
+		{"adts", append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), pad("\xff\xf1\x50\x80")...)}, // behind an ID3 tag
+		{"flac", append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), pad("fLaC\x00\x00\x00\x22")...)},
 		{"adts", pad("\xff\xf1\x50\x80")},
 		{"ac3", pad("\x0b\x77\x12\x34")},
 		{"mxf", pad("\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02")},
@@ -65,6 +65,12 @@ func TestUnsupportedFormats(t *testing.T) {
 		}
 		if !errors.Is(err, ErrUnknownFormat) || err.Error() == "videoprobe:  files are not supported" {
 			t.Errorf("%s: error %q does not match ErrUnknownFormat or has no name", c.format, err)
+		}
+	}
+	// What starts like an MP3 and holds no frames is no known format.
+	for _, in := range [][]byte{pad("ID3\x04\x00\x00"), pad("\xff\xfb\x90\x00")} {
+		if _, err := Probe(context.Background(), bytes.NewReader(in), int64(len(in))); err != ErrUnknownFormat {
+			t.Errorf("%q: %v, want ErrUnknownFormat", in[:6], err)
 		}
 	}
 	// A lone 0x47 is not a transport stream.
