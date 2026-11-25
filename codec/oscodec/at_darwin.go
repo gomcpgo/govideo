@@ -43,6 +43,8 @@ type packetDesc struct {
 
 const (
 	propBitRate       = 0x62726174 // 'brat'
+	propBitRates      = 0x61656272 // 'aebr': the bit rates the encoder has for its formats
+	propDelayMode     = 0x646d6f64 // 'dmod': how the encoder accounts for its delay
 	propMaxOutputSize = 0x786f7073 // 'xops'
 	propPrimeInfo     = 0x7072696d // 'prim'
 	propDecoderCookie = 0x646d6763 // 'dmgc'
@@ -283,12 +285,54 @@ func (d *atDecoder) Close() error {
 type atEncoder struct {
 	conv, handle   uintptr
 	rate, channels int
+	bitrate        int
 	priming        int
 	config         []byte
 	in, out, desc  cbuf
 	queue          []float32 // samples not yet handed to the converter
 	loaded, used   int       // frames in e.in, and how many the converter took
 	flushing       bool
+}
+
+// aacBitrates returns the bit rates an open AAC encoder has for its sample
+// rate and channel count, as ranges of bits per second. AudioToolbox has a
+// short list for each layout (12 to 48 kbit/s for 16 kHz mono, 64 to
+// 320 kbit/s for 48 kHz stereo) and refuses any other.
+func aacBitrates(conv uintptr) [][2]float64 {
+	var size uint32
+	if st := audioConverterPropertyInfo(conv, propBitRates, &size, nil); st != 0 || size < 16 || size > 1<<16 {
+		return nil
+	}
+	ranges := make([][2]float64, size/16) // AudioValueRange: minimum, maximum
+	size = uint32(len(ranges) * 16)
+	if st := audioConverterGetProperty(conv, propBitRates, &size, unsafe.Pointer(&ranges[0])); st != 0 {
+		return nil
+	}
+	return ranges[:min(int(size/16), len(ranges))]
+}
+
+// nearestBitrate returns the bit rate within ranges that is closest to want,
+// the higher of two that are equally close; want itself if there are none.
+func nearestBitrate(want int, ranges [][2]float64) int {
+	best, found := want, false
+	for _, r := range ranges {
+		lo, hi := int(r[0]), int(r[1])
+		if lo <= 0 || hi < lo {
+			continue
+		}
+		v := min(max(want, lo), hi)
+		if d, bd := abs(v-want), abs(best-want); !found || d < bd || d == bd && v > best {
+			best, found = v, true
+		}
+	}
+	return best
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 // NewAACEncoder returns an AudioToolbox AAC-LC encoder.
@@ -312,17 +356,36 @@ func NewAACEncoder(c AudioEncodeConfig) (codec.AudioStreamEncoder, error) {
 	if st := audioConverterNew(&in, &out, &e.conv); st != 0 {
 		return nil, osErr("opening the AAC encoder", st)
 	}
+	// At the lowest bit rates of each layout (up to 24 kbit/s for 16 kHz
+	// mono, 64 kbit/s for 48 kHz stereo) the encoder's delay is not what
+	// it is at the others. In its default delay mode, "compatibility", it
+	// still reports the usual 2112 priming frames while the sound in fact
+	// comes 1088 frames late, so a file made by the reported figure plays
+	// 1024 samples early. In "minimum" mode (1) the figure it reports is
+	// the delay it has (2127 to 2145 at those rates), and at every other
+	// rate it is 2112 and the packets are the same, byte for byte. Measured
+	// for every layout and bit rate (SPEC §14.1); TestAACPriming repeats
+	// it. An encoder that refuses the mode is left as it is.
+	mode := uint32(1)
+	audioConverterSetProperty(e.conv, propDelayMode, 4, unsafe.Pointer(&mode))
 	if c.Bitrate > 0 {
-		rate := uint32(c.Bitrate)
+		rate := uint32(nearestBitrate(c.Bitrate, aacBitrates(e.conv)))
 		if st := audioConverterSetProperty(e.conv, propBitRate, 4, unsafe.Pointer(&rate)); st != 0 {
 			audioConverterDispose(e.conv)
-			return nil, osErr(fmt.Sprintf("setting the AAC bit rate to %d", c.Bitrate), st)
+			return nil, osErr(fmt.Sprintf("setting the AAC bit rate to %d", rate), st)
 		}
+	}
+	// What the encoder aims at: the rate just set, or its own choice for
+	// the layout.
+	rate, size := uint32(0), uint32(4)
+	if st := audioConverterGetProperty(e.conv, propBitRate, &size, unsafe.Pointer(&rate)); st == 0 {
+		e.bitrate = int(rate)
 	}
 	maxOut, size := uint32(0), uint32(4)
 	if st := audioConverterGetProperty(e.conv, propMaxOutputSize, &size, unsafe.Pointer(&maxOut)); st != 0 || maxOut == 0 || maxOut > maxAudioPacket {
 		maxOut = 8192
 	}
+	// Read once the bit rate is set: the priming depends on it.
 	var prime [2]uint32 // leading and trailing frames
 	size = 8
 	if st := audioConverterGetProperty(e.conv, propPrimeInfo, &size, unsafe.Pointer(&prime)); st == 0 {
@@ -405,6 +468,7 @@ func (e *atEncoder) Flush() ([][]byte, error) {
 
 func (e *atEncoder) Config() []byte { return e.config }
 func (e *atEncoder) FrameSize() int { return 1024 }
+func (e *atEncoder) Bitrate() int   { return e.bitrate }
 func (e *atEncoder) Priming() int   { return e.priming }
 
 func (e *atEncoder) Close() error {

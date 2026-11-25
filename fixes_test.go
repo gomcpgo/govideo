@@ -306,3 +306,29 @@ func TestUnsupportedInputErrors(t *testing.T) {
 		t.Errorf("HEIC still: %v, want ErrCodecUnavailable for heic", err)
 	}
 }
+
+// TestLowBitrateAACInPlace covers a video whose sound is encoded at a low bit
+// rate. The system encoder's delay is different there from what it reports
+// in its default mode, and the track's edit list is made from the report: at
+// 64 kbit/s the sound of a 48 kHz stereo track came 1024 samples (21 ms)
+// before the picture. The sound of the video is compared with the same
+// timeline's sound written as PCM; the beeps show a slip of a sample.
+func TestLowBitrateAACInPlace(t *testing.T) {
+	requireOS(t)
+	dir := t.TempDir()
+	tl := govideo.NewTimeline(govideo.Canvas{Width: 160, Height: 120, FrameRate: govideo.R(25, 1)})
+	tl.AddGenerated(2*time.Second, govideo.GenerateOptions{Pattern: govideo.PatternTestCard, Tone: 1000, Beep: true})
+	want := exportAudio(t, tl, filepath.Join(dir, "sound.wav"), govideo.AudioExportOptions{})
+	for _, rate := range []int{64000, 192000} {
+		video := filepath.Join(dir, "video.mp4")
+		if err := tl.Export(context.Background(), video, govideo.ExportOptions{Profile: govideo.ProfileCompatible, AudioBitrate: rate}); err != nil {
+			t.Fatal(err)
+		}
+		back := govideo.NewTimeline(govideo.Canvas{})
+		back.AddClip(video, govideo.ClipOptions{})
+		got := exportAudio(t, back, filepath.Join(dir, "video.wav"), govideo.AudioExportOptions{})
+		if db := snr(t, want, got); db < 25 {
+			t.Errorf("AAC at %d bit/s: the video's sound against the programme: %.1f dB, want 25 or more: it is out of place", rate, db)
+		}
+	}
+}

@@ -89,5 +89,8 @@ type AudioStreamEncoder interface {
 	// number of leading sample frames a player must discard.
 	FrameSize() int
 	Priming() int
+	// Bitrate is the bit rate the encoder aims at, in bits per second, which
+	// need not be the one it was asked for; 0 if it is not known.
+	Bitrate() int
 	Close() error
 }

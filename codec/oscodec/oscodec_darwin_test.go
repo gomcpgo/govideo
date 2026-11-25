@@ -225,6 +225,106 @@ func TestAACRoundTrip(t *testing.T) {
 	}
 }
 
+// TestNearestBitrate checks the choice among the bit rates an encoder has.
+func TestNearestBitrate(t *testing.T) {
+	list := [][2]float64{{12000, 12000}, {16000, 16000}, {24000, 24000}, {48000, 48000}}
+	for _, c := range []struct {
+		want int
+		in   [][2]float64
+		ask  int
+	}{
+		{24000, list, 24000},
+		{12000, list, 1},
+		{48000, list, 1_000_000},
+		{16000, list, 17000},
+		{24000, list, 20000}, // midway: the higher
+		{24000, list, 30000},
+		{64000, [][2]float64{{8000, 32000}, {64000, 320000}}, 50000}, // ranges, not single rates
+		{30000, [][2]float64{{8000, 32000}, {64000, 320000}}, 30000},
+		{32000, [][2]float64{{8000, 32000}, {64000, 320000}}, 40000},
+		{70000, nil, 70000},                          // nothing known: as asked
+		{70000, [][2]float64{{0, 0}, {5, 1}}, 70000}, // nothing usable
+	} {
+		if got := nearestBitrate(c.ask, c.in); got != c.want {
+			t.Errorf("%d among %v: %d, want %d", c.ask, c.in, got, c.want)
+		}
+	}
+}
+
+// TestAACPriming measures the encoder's delay and compares it with the
+// priming it reports, at the lowest bit rate of each layout, at the
+// encoder's own choice and at the highest. A file is cut by the reported
+// figure, so where the two differ the sound is out of place: in its default
+// delay mode the system encoder reports 2112 at its lowest rates while the
+// sound is 1088 frames late (see NewAACEncoder).
+func TestAACPriming(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	// A burst of noise, which lines up with itself at one place only.
+	const frames, on, off = 12000, 3000, 7000
+	noise := make([]float32, frames)
+	seed, low := uint32(1), 0.0
+	for i := on; i < off; i++ {
+		seed = seed*1664525 + 1013904223
+		low += 0.3 * (float64(int32(seed))/(1<<31) - low)
+		noise[i] = float32(0.5 * low)
+	}
+	for _, rate := range []int{8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000} {
+		for channels := 1; channels <= 2; channels++ {
+			for _, ask := range []int{1, 0, 1 << 30} {
+				enc, err := NewAACEncoder(AudioEncodeConfig{SampleRate: rate, Channels: channels, Bitrate: ask})
+				if err != nil {
+					t.Errorf("%d Hz, %d channels, bit rate %d: %v", rate, channels, ask, err)
+					continue
+				}
+				in := make([]float32, frames*channels)
+				for i, v := range noise {
+					for c := 0; c < channels; c++ {
+						in[i*channels+c] = v
+					}
+				}
+				packets, err := enc.Encode(in)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rest, err := enc.Flush()
+				if err != nil {
+					t.Fatal(err)
+				}
+				dec, err := NewAudioDecoder(AudioConfig{Codec: "aac", SampleRate: rate, Channels: channels, Config: enc.Config()})
+				if err != nil {
+					t.Fatal(err)
+				}
+				var pcm []float32
+				for _, p := range append(packets, rest...) {
+					fr, err := dec.Decode(p)
+					if err != nil {
+						t.Fatal(err)
+					}
+					pcm = append(pcm, fr.Samples...)
+				}
+				dec.(interface{ Close() error }).Close()
+				delay, best := 0, math.Inf(-1)
+				for lag := 0; lag <= 4500; lag++ {
+					var sum float64
+					for i := on - 100; i < off+100 && (i+lag)*channels < len(pcm); i++ {
+						sum += float64(noise[i]) * float64(pcm[(i+lag)*channels])
+					}
+					if sum > best {
+						delay, best = lag, sum
+					}
+				}
+				if p, b := enc.Priming(), enc.Bitrate(); delay != p || b < 8000 || b > 320000 {
+					t.Errorf("%d Hz, %d channels, bit rate %d (asked %d): the sound is %d frames late and the encoder reports %d of priming",
+						rate, channels, b, ask, delay, p)
+				}
+				enc.Close()
+			}
+		}
+	}
+}
+
 // TestSessionsAreReleased opens and closes many sessions; a leak of handles
 // shows up as the registry growing.
 func TestSessionsAreReleased(t *testing.T) {

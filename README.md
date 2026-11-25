@@ -75,6 +75,15 @@ err := tl.Export(ctx, "out.mp4", govideo.ExportOptions{
 })
 ```
 
+The sound of a timeline can be written by itself, for example a recording made ready for speech recognition:
+
+```go
+tl := govideo.NewTimeline(govideo.Canvas{})
+tl.AddClip("meeting.mp4", govideo.ClipOptions{Trim: govideo.Range(0, 30*time.Minute)})
+
+err := tl.ExportAudio(ctx, "meeting.m4a", govideo.AudioExportOptions{SampleRate: 16000, Channels: 1})
+```
+
 What works today:
 
 - **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Interlaced H.264 is deinterlaced: each frame is shown as its two fields, in the order the stream gives, so a 50 or 60 fps canvas keeps all of the motion and a slower one shows no combing. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
@@ -89,6 +98,10 @@ What works today:
   - `ProfileCompatible`: H.264 High + AAC-LC, tagged BT.709. macOS only for now. Video is encoded to a picture quality chosen by `Quality`, so the size follows the content: a slide show comes out small, a busy scene keeps its detail and takes what it needs. Where the system encoder has no quality mode (Intel Macs without a hardware encoder, for one) an average bit rate chosen from the picture size is used. Set `VideoBitrate` when you need a predictable size instead (the two cannot be combined: the system encoder has no quality mode with a ceiling). `AudioBitrate` sets the audio rate.
   - `ProfileIntermediate`: Motion JPEG + 16-bit LPCM, using only native codecs, on every platform. The files are large; this is a format that editors and ffmpeg read, not a delivery format.
   - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
+- **Audio-only export** (`ExportAudio`): the timeline's sound as a file, at a sample rate and channel count of your choosing (48 kHz stereo unless you say otherwise; one channel is the two mixed to mono). No picture is decoded, so it is fast, and a clip gives its sound even where its video has no decoder.
+  - `.wav`: 16-bit PCM, on every platform. Up to 4 GB, which is 37 hours at 16 kHz mono and 6 hours at 48 kHz stereo.
+  - `.m4a`: AAC-LC from the system encoder. macOS only for now. `Bitrate` is taken to the nearest rate the encoder has for the layout; left at 0, the encoder chooses (24 kbit/s for 16 kHz mono, about 11 MB an hour; 128 kbit/s for 48 kHz stereo).
+  - The file is as long as the timeline to the sample, and segments start and end on the sample nearest their time, not on a frame of the canvas. An `AddAudio` file in `Track` mode, which is a separate track of a video, is left out.
 
 Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; deinterlacing rebuilds each field on its own, so a stream marked interlaced whose pictures are not loses vertical detail (set `ClipOptions.Deinterlace` to `DeinterlaceOff` for such a clip, or to a field order for an interlaced stream that is not marked); H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
@@ -110,7 +123,7 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`, audio-only export (`ExportAudio`). To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |

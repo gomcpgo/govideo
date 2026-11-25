@@ -1,13 +1,16 @@
 package govideo
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"os"
 
 	"github.com/gomcpgo/govideo/codec"
 	"github.com/gomcpgo/govideo/codec/native"
 	"github.com/gomcpgo/govideo/codec/oscodec"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
+	"github.com/gomcpgo/govideo/internal/container/wav"
 	"github.com/gomcpgo/govideo/process"
 )
 
@@ -20,7 +23,9 @@ type videoSink interface {
 	close()
 }
 
-// audioSink encodes one output audio track. Samples are 48 kHz stereo.
+// audioSink encodes one output audio track, or the file of an audio-only
+// export. Samples are interleaved, at the sink's sample rate and channel
+// count: 48 kHz stereo for the tracks of a video.
 type audioSink interface {
 	write(samples []float32) error
 	// finish ends the track, which carries total sample frames of programme.
@@ -175,6 +180,66 @@ func (s *aacSink) finish(total int64) error {
 
 func (s *aacSink) close() { s.enc.Close() }
 
+// newAACSink adds an AAC-LC track to mux and opens its encoder. cfg carries
+// what the caller decides about the track (language, flags); the sample
+// entry and the timescale, which is the sample rate, are set here. bitrate 0
+// leaves the rate to the encoder.
+func newAACSink(mux *isobmff.Muxer, brand isobmff.Brand, cfg isobmff.TrackConfig, rate, channels, bitrate int) (*aacSink, error) {
+	enc, err := oscodec.NewAACEncoder(oscodec.AudioEncodeConfig{SampleRate: rate, Channels: channels, Bitrate: bitrate})
+	if err != nil {
+		return nil, err
+	}
+	aim := uint32(enc.Bitrate())
+	esds := isobmff.ESDS(0x40, 0x05, enc.Config(), 0, aim, aim)
+	cfg.Handler, cfg.Timescale = "soun", uint32(rate)
+	if brand == isobmff.BrandMOV {
+		cfg.Entry = isobmff.AudioEntryQT("mp4a", channels, rate, enc.FrameSize(), esds)
+	} else {
+		cfg.Entry = isobmff.AudioEntry("mp4a", channels, 16, rate, esds)
+	}
+	return &aacSink{mux: mux, track: mux.AddTrack(cfg), enc: enc}, nil
+}
+
+// wavSink writes an audio-only export as a WAVE file of 16-bit PCM. The
+// header goes in last, when the length is known.
+type wavSink struct {
+	f              *os.File
+	w              *bufio.Writer
+	rate, channels int
+	frames         int64
+	buf            []byte
+}
+
+// newWAVSink starts a WAVE file in f, which must be empty.
+func newWAVSink(f *os.File, rate, channels int) (*wavSink, error) {
+	s := &wavSink{f: f, w: bufio.NewWriterSize(f, 1<<18), rate: rate, channels: channels}
+	if _, err := s.w.Write(make([]byte, wav.HeaderSize)); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *wavSink) write(samples []float32) error {
+	s.buf = native.AppendS16LE(s.buf[:0], samples)
+	s.frames += int64(len(samples) / s.channels)
+	_, err := s.w.Write(s.buf)
+	return err
+}
+
+func (s *wavSink) finish(int64) error {
+	if err := s.w.Flush(); err != nil {
+		return err
+	}
+	h, err := wav.PCMHeader(s.channels, s.rate, 16, s.frames)
+	if err != nil {
+		return fmt.Errorf("govideo: %w", err)
+	}
+	_, err = s.f.WriteAt(h, 0)
+	return err
+}
+
+func (s *wavSink) close() {}
+
 // outputs creates the tracks of an export for one profile.
 type outputs struct {
 	profile Profile
@@ -273,7 +338,7 @@ func (o *outputs) video(timescale, dur uint32) (videoSink, error) {
 	return s, nil
 }
 
-// audio adds an audio track and returns its sink and track index.
+// audio adds an audio track and returns its sink.
 func (o *outputs) audio(language string, disabled bool) (audioSink, error) {
 	cfg := isobmff.TrackConfig{Handler: "soun", Timescale: outRate, AltGroup: 1, Language: language, Disabled: disabled}
 	if o.profile == ProfileIntermediate {
@@ -285,18 +350,10 @@ func (o *outputs) audio(language string, disabled bool) (audioSink, error) {
 		}
 		return &pcmSink{mux: o.mux, track: o.mux.AddTrack(cfg)}, nil
 	}
-	rate := o.audioBitrate()
-	enc, err := oscodec.NewAACEncoder(oscodec.AudioEncodeConfig{SampleRate: outRate, Channels: 2, Bitrate: rate})
+	s, err := newAACSink(o.mux, o.brand, cfg, outRate, 2, o.audioBitrate())
 	if err != nil {
 		return nil, fmt.Errorf("govideo: %w", err)
 	}
-	esds := isobmff.ESDS(0x40, 0x05, enc.Config(), 0, uint32(rate), uint32(rate))
-	if o.brand == isobmff.BrandMOV {
-		cfg.Entry = isobmff.AudioEntryQT("mp4a", 2, outRate, enc.FrameSize(), esds)
-	} else {
-		cfg.Entry = isobmff.AudioEntry("mp4a", 2, 16, outRate, esds)
-	}
-	s := &aacSink{mux: o.mux, track: o.mux.AddTrack(cfg), enc: enc}
 	o.sinks = append(o.sinks, s)
 	return s, nil
 }

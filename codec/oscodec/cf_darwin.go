@@ -58,11 +58,12 @@ var (
 	vtCompressionSessionInvalidate   func(session uintptr)
 	vtSessionSetProperty             func(session, key, value uintptr) int32
 
-	audioConverterNew         func(in, out *asbd, conv *uintptr) int32
-	audioConverterDispose     func(conv uintptr) int32
-	audioConverterSetProperty func(conv uintptr, id uint32, size uint32, data unsafe.Pointer) int32
-	audioConverterGetProperty func(conv uintptr, id uint32, size *uint32, data unsafe.Pointer) int32
-	audioConverterFill        func(conv, proc, user uintptr, packets *uint32, out *audioBufferList, desc unsafe.Pointer) int32
+	audioConverterNew          func(in, out *asbd, conv *uintptr) int32
+	audioConverterDispose      func(conv uintptr) int32
+	audioConverterSetProperty  func(conv uintptr, id uint32, size uint32, data unsafe.Pointer) int32
+	audioConverterGetProperty  func(conv uintptr, id uint32, size *uint32, data unsafe.Pointer) int32
+	audioConverterPropertyInfo func(conv uintptr, id uint32, size *uint32, writable *byte) int32
+	audioConverterFill         func(conv, proc, user uintptr, packets *uint32, out *audioBufferList, desc unsafe.Pointer) int32
 
 	cMalloc func(n int) unsafe.Pointer
 	cFree   func(p unsafe.Pointer)
@@ -175,6 +176,7 @@ func load() (err error) {
 	bind(&audioConverterDispose, at, "AudioConverterDispose")
 	bind(&audioConverterSetProperty, at, "AudioConverterSetProperty")
 	bind(&audioConverterGetProperty, at, "AudioConverterGetProperty")
+	bind(&audioConverterPropertyInfo, at, "AudioConverterGetPropertyInfo")
 	bind(&audioConverterFill, at, "AudioConverterFillComplexBuffer")
 
 	bind(&cMalloc, sys, "malloc")

@@ -98,5 +98,9 @@ type AudioConfig struct {
 // AudioEncodeConfig describes an AAC-LC encode.
 type AudioEncodeConfig struct {
 	SampleRate, Channels int
-	Bitrate              int // bits per second
+	// Bitrate is in bits per second. A system encoder has a list of rates
+	// for each sample rate and channel count, and the one nearest to Bitrate
+	// is used; 0 leaves the choice to the encoder. The encoder's Bitrate
+	// method says what it came to.
+	Bitrate int
 }

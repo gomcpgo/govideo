@@ -12,6 +12,7 @@ type Brand int
 const (
 	BrandMP4 Brand = iota // ISO MP4 ("isom")
 	BrandMOV              // QuickTime ("qt  ")
+	BrandM4A              // MP4 holding audio only ("M4A "), otherwise as BrandMP4
 )
 
 // TrackConfig describes one output track.
@@ -56,18 +57,32 @@ type muxTrack struct {
 // to a scratch file; Finish assembles the final file. Memory use is limited
 // to the sample tables.
 type Muxer struct {
-	brand   Brand
-	scratch io.ReadWriteSeeker
-	tracks  []*muxTrack
-	last    int
-	dataLen int64
-	done    bool
+	brand     Brand
+	scratch   io.ReadWriteSeeker
+	timescale uint32 // of the movie: what track and edit lengths are written in
+	tracks    []*muxTrack
+	last      int
+	dataLen   int64
+	done      bool
 }
 
 // NewMuxer returns a Muxer that spools media data to scratch, which must be
 // empty and positioned at its start.
 func NewMuxer(brand Brand, scratch io.ReadWriteSeeker) *Muxer {
-	return &Muxer{brand: brand, scratch: scratch, last: -1}
+	return &Muxer{brand: brand, scratch: scratch, timescale: 1000, last: -1}
+}
+
+// SetMovieTimescale sets the units per second in which the lengths of the
+// movie, its tracks and their edits are written: 1000 unless set. A track
+// plays for the length its edit gives, so with milliseconds an audio track
+// ends up to half a millisecond early or late; an audio file that must end
+// on the sample sets the sample rate here. Those lengths are 32-bit: at
+// 48000 they reach a little under 25 hours. It may be called any time before
+// Finish; 0 is ignored.
+func (m *Muxer) SetMovieTimescale(ts uint32) {
+	if ts > 0 {
+		m.timescale = ts
+	}
 }
 
 // AddTrack adds a track and returns its index. All tracks must be added
@@ -202,11 +217,18 @@ func (m *Muxer) Finish(w io.Writer) error {
 
 	ftyp := &buf{}
 	ftyp.box("ftyp", func() {
-		if m.brand == BrandMOV {
+		switch m.brand {
+		case BrandMOV:
 			ftyp.str("qt  ")
 			ftyp.u32(0x200)
 			ftyp.str("qt  ")
-		} else {
+		case BrandM4A:
+			// The brand audio players and Apple's software look for in an
+			// .m4a file.
+			ftyp.str("M4A ")
+			ftyp.u32(0)
+			ftyp.str("M4A mp42isom")
+		default:
 			ftyp.str("isom")
 			ftyp.u32(0x200)
 			ftyp.str("isomiso2mp41")
@@ -259,20 +281,19 @@ func (m *Muxer) Finish(w io.Writer) error {
 	return nil
 }
 
-const movieTimescale = 1000
-
-func scaleDur(d uint64, from uint32) uint64 {
+// scaleDur converts d ticks of a track's timescale, from, to the movie's.
+func (m *Muxer) scaleDur(d uint64, from uint32) uint64 {
 	if from == 0 {
 		return 0
 	}
-	return (d*movieTimescale + uint64(from)/2) / uint64(from)
+	return (d*uint64(m.timescale) + uint64(from)/2) / uint64(from)
 }
 
 func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 	b := &buf{}
 	var movieDur uint64
 	for _, t := range m.tracks {
-		if d := scaleDur(t.presented(), t.cfg.Timescale); d > movieDur {
+		if d := m.scaleDur(t.presented(), t.cfg.Timescale); d > movieDur {
 			movieDur = d
 		}
 	}
@@ -286,7 +307,7 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 			b.u32(0) // version 0
 			b.u32(0)
 			b.u32(0)
-			b.u32(movieTimescale)
+			b.u32(m.timescale)
 			b.u32(uint32(movieDur))
 			b.u32(0x10000) // rate
 			b.u16(0x100)   // volume
@@ -308,7 +329,7 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 					b.u32(0)
 					b.u32(uint32(i + 1))
 					b.u32(0)
-					b.u32(uint32(scaleDur(t.presented(), cfg.Timescale)))
+					b.u32(uint32(m.scaleDur(t.presented(), cfg.Timescale)))
 					b.zero(8)
 					b.u16(0) // layer
 					b.u16(uint16(cfg.AltGroup))
@@ -327,7 +348,7 @@ func (m *Muxer) buildMoov(base int64, co64 bool) []byte {
 						b.box("elst", func() {
 							b.u32(0)
 							b.u32(1)
-							b.u32(uint32(scaleDur(dur, cfg.Timescale)))
+							b.u32(uint32(m.scaleDur(dur, cfg.Timescale)))
 							b.u32(uint32(start))
 							b.u32(0x10000) // rate 1.0
 						})

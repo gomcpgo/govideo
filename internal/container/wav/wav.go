@@ -1,10 +1,12 @@
-// Package wav locates the PCM payload of RIFF/WAVE files.
+// Package wav locates the PCM payload of RIFF/WAVE files, and writes the
+// header of one.
 package wav
 
 import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -103,4 +105,48 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 		off = body + n + n&1
 	}
 	return nil, ErrNotWAV
+}
+
+// HeaderSize is the length of the header PCMHeader returns; the samples
+// follow it.
+const HeaderSize = 44
+
+// MaxDataSize is the most sample data, in bytes, a RIFF/WAVE file holds: its
+// sizes are 32-bit, and the first of them counts the rest of the header too.
+const MaxDataSize = 0xffffffff - (HeaderSize - 8)
+
+// PCMHeader returns the header of a WAVE file holding frames sample frames
+// of integer PCM, little-endian, bits wide (8, 16, 24 or 32): the canonical
+// form, a 'fmt ' chunk of 16 bytes followed at once by the 'data' chunk,
+// which is what the simplest readers expect to find.
+func PCMHeader(channels, sampleRate, bits int, frames int64) ([]byte, error) {
+	if channels < 1 || channels > 0xffff || sampleRate < 1 || int64(sampleRate) > 0xffffffff {
+		return nil, fmt.Errorf("wav: cannot write %d channels at %d Hz", channels, sampleRate)
+	}
+	if bits != 8 && bits != 16 && bits != 24 && bits != 32 {
+		return nil, fmt.Errorf("wav: cannot write %d-bit samples", bits)
+	}
+	align := int64(channels * bits / 8)
+	if align > 0xffff || int64(sampleRate)*align > 0xffffffff {
+		return nil, fmt.Errorf("wav: cannot write %d channels at %d Hz", channels, sampleRate)
+	}
+	if frames < 0 || frames > MaxDataSize/align {
+		return nil, fmt.Errorf("wav: %d sample frames do not fit in a WAVE file (4 GB)", frames)
+	}
+	size := frames * align
+	le := binary.LittleEndian
+	h := make([]byte, 0, HeaderSize)
+	h = append(h, "RIFF"...)
+	h = le.AppendUint32(h, uint32(size+HeaderSize-8))
+	h = append(h, "WAVEfmt "...)
+	h = le.AppendUint32(h, 16)
+	h = le.AppendUint16(h, 1) // WAVE_FORMAT_PCM
+	h = le.AppendUint16(h, uint16(channels))
+	h = le.AppendUint32(h, uint32(sampleRate))
+	h = le.AppendUint32(h, uint32(int64(sampleRate)*align)) // bytes per second
+	h = le.AppendUint16(h, uint16(align))
+	h = le.AppendUint16(h, uint16(bits))
+	h = append(h, "data"...)
+	h = le.AppendUint32(h, uint32(size))
+	return h, nil
 }

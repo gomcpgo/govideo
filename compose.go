@@ -111,15 +111,21 @@ type segment struct {
 	fitSeq int64
 
 	// Fades, in output frames for the picture and in 48 kHz sample frames
-	// for the sound; alen is the length of the segment's sound and apos how
-	// much of it has been produced.
+	// for the sound. The segment's sound starts at sample frame astart of
+	// the programme and is alen long; apos is how much of it has been
+	// produced. An audio-only export sets these and no frames.
 	fadeIn, fadeOut   int64
 	afadeIn, afadeOut int64
-	alen, apos        int64
+	astart, alen      int64
+	apos              int64
 }
 
 // end is the output frame after the segment's last.
 func (sg *segment) end() int64 { return sg.start + sg.frames }
+
+// aend is the sample frame of the programme after the last of the segment's
+// sound.
+func (sg *segment) aend() int64 { return sg.astart + sg.alen }
 
 // picture returns the segment's frame n as a canvas-sized picture, and a
 // number that changes whenever the picture does (a still's never does). The
