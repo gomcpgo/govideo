@@ -1247,15 +1247,16 @@ func decodeStill(path string, bg color.Color) (*codec.VideoFrame, error) {
 		}
 		return nil, fmt.Errorf("govideo: %s: %w", path, err)
 	}
+	// JPEG, PNG and WebP can each say which way up the picture goes.
+	orient := process.EXIFOrientation(bytes.NewReader(data))
 	if format == "webp" {
 		// Lossy WebP is limited-range video Y'CbCr, not JPEG's full range.
 		switch m := img.(type) {
 		case *image.YCbCr:
-			return process.FromVideoYCbCr(m), nil
+			return process.OrientFrame(process.FromVideoYCbCr(m), orient), nil
 		case *image.NYCbCrA:
-			return process.FromVideoNYCbCrA(m, bg), nil
+			return process.OrientFrame(process.FromVideoNYCbCrA(m, bg), orient), nil
 		}
 	}
-	orient := process.EXIFOrientation(bytes.NewReader(data))
 	return process.FromImageOver(process.Orient(img, orient), bg), nil
 }

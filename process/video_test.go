@@ -3,9 +3,13 @@ package process
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/jpeg"
+	"image/png"
+	"io"
 	"math/rand"
 	"testing"
 
@@ -377,13 +381,9 @@ func TestRotate(t *testing.T) {
 	}
 }
 
-// jpegWithOrientation encodes a small JPEG and splices in an EXIF APP1
-// segment carrying the orientation tag.
-func jpegWithOrientation(t testing.TB, o uint16, bo binary.ByteOrder) []byte {
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, image.NewGray(image.Rect(0, 0, 8, 8)), nil); err != nil {
-		t.Fatal(err)
-	}
+// exifTIFF returns the TIFF structure that EXIF data is, with two entries
+// in its directory: ImageWidth, to be passed over, and the orientation.
+func exifTIFF(o uint16, bo binary.ByteOrder) []byte {
 	tiff := make([]byte, 8+2+2*12+4)
 	if bo == binary.LittleEndian {
 		copy(tiff, "II")
@@ -402,7 +402,17 @@ func jpegWithOrientation(t testing.TB, o uint16, bo binary.ByteOrder) []byte {
 	bo.PutUint16(tiff[24:], 3)
 	bo.PutUint32(tiff[26:], 1)
 	bo.PutUint16(tiff[30:], o)
-	payload := append([]byte("Exif\x00\x00"), tiff...)
+	return tiff
+}
+
+// jpegWithOrientation encodes a small JPEG and splices in an EXIF APP1
+// segment carrying the orientation tag.
+func jpegWithOrientation(t testing.TB, o uint16, bo binary.ByteOrder) []byte {
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, image.NewGray(image.Rect(0, 0, 8, 8)), nil); err != nil {
+		t.Fatal(err)
+	}
+	payload := append([]byte("Exif\x00\x00"), exifTIFF(o, bo)...)
 	seg := []byte{0xFF, 0xE1, byte((len(payload) + 2) >> 8), byte(len(payload) + 2)}
 	seg = append(seg, payload...)
 	// An unrelated APP0-style segment first, to exercise skipping.
@@ -412,6 +422,54 @@ func jpegWithOrientation(t testing.TB, o uint16, bo binary.ByteOrder) []byte {
 	out = append(out, skip...)
 	out = append(out, seg...)
 	return append(out, j[2:]...)
+}
+
+// pngChunk returns one PNG chunk: length, type, data and checksum.
+func pngChunk(kind string, data []byte) []byte {
+	c := binary.BigEndian.AppendUint32(nil, uint32(len(data)))
+	c = append(append(c, kind...), data...)
+	return binary.BigEndian.AppendUint32(c, crc32.ChecksumIEEE(c[4:]))
+}
+
+// pngWithEXIF encodes a small PNG and splices in an eXIf chunk holding
+// exif: straight after the header (IHDR), or after the picture when last
+// is set. Both places are allowed.
+func pngWithEXIF(t testing.TB, exif []byte, last bool) []byte {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewGray(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	p := buf.Bytes()
+	at := 8 + 12 + 13 // the signature and IHDR
+	if last {
+		at = len(p) - 12 // before IEND
+	}
+	out := append([]byte{}, p[:at]...)
+	out = append(out, pngChunk("eXIf", exif)...)
+	return append(out, p[at:]...)
+}
+
+// riffChunk returns one RIFF chunk, padded to an even length.
+func riffChunk(kind string, data []byte) []byte {
+	c := binary.LittleEndian.AppendUint32([]byte(kind), uint32(len(data)))
+	c = append(c, data...)
+	if len(data)%2 == 1 {
+		c = append(c, 0)
+	}
+	return c
+}
+
+// webpWithEXIF returns the container of an extended-format WebP file with
+// an EXIF chunk after the picture, as the format orders them. The picture
+// chunk is filler of an odd length (so that it is padded): the orientation
+// reader does not decode pictures. Stills that decode are in the package
+// above (TestStillOrientation).
+func webpWithEXIF(exif []byte) []byte {
+	body := []byte("WEBP")
+	body = append(body, riffChunk("VP8X", []byte{0x08, 0, 0, 0, 7, 0, 0, 7, 0, 0})...) // the EXIF flag; 8x8
+	body = append(body, riffChunk("VP8L", []byte{0x2f, 1, 2, 3, 4})...)
+	body = append(body, riffChunk("EXIF", exif)...)
+	return append(binary.LittleEndian.AppendUint32([]byte("RIFF"), uint32(len(body))), body...)
 }
 
 func TestEXIFOrientation(t *testing.T) {
@@ -447,17 +505,111 @@ func TestEXIFOrientation(t *testing.T) {
 	}
 }
 
+// TestEXIFOrientationPNGWebP reads the tag from the eXIf chunk of a PNG and
+// the EXIF chunk of a WebP file, and takes malformed ones for upright.
+func TestEXIFOrientationPNGWebP(t *testing.T) {
+	// A reader that cannot seek takes the other way past the picture.
+	read := func(t *testing.T, name string, data []byte, want int) {
+		t.Helper()
+		if got := EXIFOrientation(bytes.NewReader(data)); got != want {
+			t.Errorf("%s: got %d, want %d", name, got, want)
+		}
+		if got := EXIFOrientation(struct{ io.Reader }{bytes.NewReader(data)}); got != want {
+			t.Errorf("%s, not seeking: got %d, want %d", name, got, want)
+		}
+	}
+	for _, bo := range []binary.ByteOrder{binary.LittleEndian, binary.BigEndian} {
+		for o := 1; o <= 8; o++ {
+			tiff := exifTIFF(uint16(o), bo)
+			jpegStyle := append([]byte("Exif\x00\x00"), tiff...)
+			for name, data := range map[string][]byte{
+				"png":                    pngWithEXIF(t, tiff, false),
+				"png, after the picture": pngWithEXIF(t, tiff, true),
+				"webp":                   webpWithEXIF(tiff),
+				"webp, Exif prefix":      webpWithEXIF(jpegStyle),
+			} {
+				read(t, fmt.Sprintf("%s, %v, orientation %d", name, bo, o), data, o)
+			}
+		}
+		read(t, "png, orientation 9", pngWithEXIF(t, exifTIFF(9, bo), false), 1)
+		read(t, "webp, orientation 9", webpWithEXIF(exifTIFF(9, bo)), 1)
+	}
+	for _, last := range []bool{false, true} {
+		if _, err := png.Decode(bytes.NewReader(pngWithEXIF(t, exifTIFF(6, binary.BigEndian), last))); err != nil {
+			t.Fatalf("test PNG (eXIf last: %v) is not decodable: %v", last, err)
+		}
+	}
+
+	tiff := exifTIFF(6, binary.BigEndian)
+	p, w := pngWithEXIF(t, tiff, true), webpWithEXIF(tiff)
+	var plain bytes.Buffer
+	png.Encode(&plain, image.NewGray(image.Rect(0, 0, 8, 8)))
+	// A PNG whose eXIf chunk claims more than the file holds, and one
+	// whose first chunk does: neither may be believed or allocated.
+	long := pngWithEXIF(t, tiff, false)
+	binary.BigEndian.PutUint32(long[8+12+13:], 1<<31-1)
+	skipLong := append([]byte{}, p...)
+	binary.BigEndian.PutUint32(skipLong[8:], 1<<31-1)
+	tooLong := append([]byte{}, p...)
+	binary.BigEndian.PutUint32(tooLong[8:], 1<<31)
+	// The same PNG with the tag after the end marker, where it is not
+	// part of the image.
+	afterEnd := append(plain.Bytes()[:plain.Len():plain.Len()], pngChunk("eXIf", tiff)...)
+	// A WebP file whose RIFF size ends before the EXIF chunk: the chunk
+	// is outside the file as the container describes it.
+	short := append([]byte{}, w...)
+	binary.LittleEndian.PutUint32(short[4:], uint32(len(w)-8-len(riffChunk("EXIF", tiff))))
+	chunkLong := append([]byte{}, w...)
+	binary.LittleEndian.PutUint32(chunkLong[12+18+4:], 1<<32-1) // the picture chunk
+	for name, c := range map[string]struct {
+		data []byte
+		want int
+	}{
+		"plain png":                     {plain.Bytes(), 1},
+		"png cut in the chunk header":   {p[:len(p)-12-len(tiff)-10], 1},
+		"png cut in the tag":            {p[:len(p)-12-4-6], 1},
+		"png, eXIf longer than file":    {long, 6}, // what is there is read
+		"png, chunk longer than file":   {skipLong, 1},
+		"png, chunk length over 2^31-1": {tooLong, 1},
+		"png, eXIf after IEND":          {afterEnd, 1},
+		"png, empty eXIf":               {pngWithEXIF(t, nil, false), 1},
+		"png, eXIf not TIFF":            {pngWithEXIF(t, []byte("Exif\x00\x00notTIFF!"), false), 1},
+		"webp without EXIF":             {webpWithEXIF(tiff)[:12+18+14], 1},
+		"webp cut in the tag":           {w[:len(w)-6], 1},
+		"webp, RIFF size before EXIF":   {short, 1},
+		"webp, chunk longer than file":  {chunkLong, 1},
+		"webp, empty EXIF":              {webpWithEXIF(nil), 1},
+		"riff, not webp":                {append([]byte("RIFF\x00\x01\x00\x00WAVE"), w[12:]...), 1},
+	} {
+		read(t, name, c.data, c.want)
+	}
+}
+
 func FuzzEXIFOrientation(f *testing.F) {
 	f.Add(jpegWithOrientation(f, 6, binary.BigEndian))
 	f.Add(jpegWithOrientation(f, 3, binary.LittleEndian))
+	f.Add(pngWithEXIF(f, exifTIFF(6, binary.BigEndian), false))
+	f.Add(pngWithEXIF(f, exifTIFF(8, binary.LittleEndian), true))
+	f.Add(webpWithEXIF(exifTIFF(5, binary.LittleEndian)))
+	f.Add(webpWithEXIF(append([]byte("Exif\x00\x00"), exifTIFF(7, binary.BigEndian)...)))
 	f.Add([]byte{0xFF, 0xD8, 0xFF, 0xE1, 0, 2})
 	f.Add([]byte("Exif\x00\x00II*\x00\xff\xff\xff\xff"))
+	f.Add([]byte("\x89PNG\r\n\x1a\n\x7f\xff\xff\xffeXIfMM\x00*\x00\x00\x00\x08"))
+	f.Add([]byte("RIFF\xff\xff\xff\xffWEBPEXIF\xff\xff\xff\xffII*\x00\x08\x00\x00\x00"))
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if o := EXIFOrientation(bytes.NewReader(data)); o < 1 || o > 8 {
+		o := EXIFOrientation(bytes.NewReader(data))
+		if o < 1 || o > 8 {
 			t.Fatalf("orientation %d out of range", o)
+		}
+		// Seeking past a chunk and reading past it must come to the same.
+		if s := EXIFOrientation(struct{ io.Reader }{bytes.NewReader(data)}); s != o {
+			t.Fatalf("orientation %d when seeking, %d when not", o, s)
 		}
 		if o := parseEXIFOrientation(data); o < 0 || o > 8 {
 			t.Fatalf("parsed orientation %d out of range", o)
+		}
+		if o := tiffOrientation(data); o < 0 || o > 8 {
+			t.Fatalf("TIFF orientation %d out of range", o)
 		}
 	})
 }
