@@ -17,7 +17,8 @@ jobs:
       # Where ffmpeg has every encoder the fixtures need (apt's and Homebrew's
       # builds), a test that cannot run for want of the oracle fails rather
       # than skips, so it cannot stop running unnoticed. Windows only lists
-      # what it skipped: Chocolatey's build has not been checked for them.
+      # what it skipped: Chocolatey's build has no libsvtav1, so the seven
+      # AV1 fixtures are not made there.
       GOVIDEO_ORACLE_STRICT: ${{ !startsWith(matrix.os, 'windows') && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
