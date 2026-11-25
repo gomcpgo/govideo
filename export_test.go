@@ -262,13 +262,9 @@ func TestTransparentStill(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
-	stills := map[string]string{"png": src}
-	webp := filepath.Join(dir, "logo.webp")
-	if err := oracle.TryFFmpeg("-i", src, "-c:v", "libwebp", "-lossless", "0", "-quality", "95", "-pix_fmt", "yuva420p", webp); err != nil {
-		t.Logf("the oracle has no WebP encoder; testing PNG only: %v", err)
-	} else {
-		stills["webp"] = webp
-	}
+	// The same picture as lossy WebP (see logoWebP).
+	webp, _ := writeWebP(t, dir, "logo.webp", logoWebP)
+	stills := map[string]string{"png": src, "webp": webp}
 
 	blue := color.NRGBA{32, 64, 192, 255}
 	for kind, path := range stills {

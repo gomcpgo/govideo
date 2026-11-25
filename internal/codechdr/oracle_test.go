@@ -17,15 +17,13 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/gomcpgo/govideo/internal/oracle"
 )
 
 func needOracle(t *testing.T) {
 	t.Helper()
-	for _, bin := range []string{"ffmpeg", "ffprobe"} {
-		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not installed; skipping oracle test", bin)
-		}
-	}
+	oracle.Require(t)
 }
 
 var encoders = sync.OnceValue(func() string {
@@ -43,10 +41,11 @@ func hasEncoder(name string) bool {
 	return false
 }
 
-// generate runs ffmpeg and returns the output path. With optional set, an
-// encoder failure skips the test (hardware/OS encoders are not always
-// usable). An ffmpeg built without the encoder skips it in any case: the
-// smaller Windows builds have no AV1 encoder, for one.
+// generate runs ffmpeg and returns the output path. With optional set, the
+// fixture needs a hardware or OS encoder, which only some platforms have and
+// which is not always usable: the test is skipped without it. An ffmpeg
+// built without any other encoder is an incomplete oracle (oracle.Missing):
+// the smaller Windows builds have no AV1 encoder, for one.
 func generate(t *testing.T, optional bool, out string, args ...string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), out)
@@ -54,7 +53,10 @@ func generate(t *testing.T, optional bool, out string, args ...string) string {
 	full = append(full, path)
 	for i, arg := range args[:len(args)-1] {
 		if enc := args[i+1]; (arg == "-c:v" || arg == "-c:a") && !hasEncoder(enc) {
-			t.Skipf("this ffmpeg has no %s encoder", enc)
+			if optional {
+				t.Skipf("this ffmpeg has no %s encoder", enc)
+			}
+			oracle.Missing(t, "this ffmpeg has no %s encoder", enc)
 		}
 	}
 	if b, err := exec.Command("ffmpeg", full...).CombinedOutput(); err != nil {

@@ -109,7 +109,15 @@ A JSON project file for describing builds, and a small command line for simple o
 go test ./...
 ```
 
-Tests that compare against ffprobe or decode exports with ffmpeg skip themselves when those binaries are not installed, and tests of the system codecs skip where there are none. Test media is generated at test time and never committed.
+Tests that compare against ffprobe or decode exports with ffmpeg skip themselves when those binaries are not installed or lack an encoder a fixture needs, and tests of the system codecs skip where there are none. Since `go test` shows a skipped test as it shows a passing one, this lists them with their reasons:
+
+```
+go run ./internal/testreport ./...
+```
+
+It takes the arguments of `go test`. With `GOVIDEO_ORACLE_STRICT=1` a test that would skip for want of ffmpeg fails instead; CI sets it on Linux and macOS.
+
+Test media is generated at test time and never committed, apart from two WebP stills of a few hundred bytes written out in `webp_test.go`.
 
 To check your own footage, point the suite at a folder of media files. Each file is exported with every available profile and the picture is compared with ffmpeg's own decoding of the source:
 

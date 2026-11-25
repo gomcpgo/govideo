@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/gomcpgo/govideo/internal/oracle"
 )
 
 // These tests use the locally installed ffmpeg/ffprobe binaries as black-box
@@ -33,18 +35,15 @@ type ffOut struct {
 }
 
 func needTools(t *testing.T) {
-	for _, tool := range []string{"ffmpeg", "ffprobe"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s not in PATH", tool)
-		}
-	}
+	t.Helper()
+	oracle.Require(t)
 }
 
 func ffmpeg(t *testing.T, args ...string) {
 	t.Helper()
 	args = append([]string{"-hide_banner", "-loglevel", "error", "-y"}, args...)
 	if out, err := exec.Command("ffmpeg", args...).CombinedOutput(); err != nil {
-		t.Skipf("ffmpeg %v: %v\n%s", args, err, out)
+		oracle.Missing(t, "ffmpeg %v: %v\n%s", args, err, out)
 	}
 }
 
@@ -116,7 +115,7 @@ func TestOracleLive(t *testing.T) {
 				[]string{"-c:v", "libvpx", "-c:a", "libopus", "-live", live, "-f", "webm", "pipe:1"})
 			out, err := exec.Command("ffmpeg", args...).Output()
 			if err != nil {
-				t.Skipf("ffmpeg: %v", err)
+				oracle.Missing(t, "ffmpeg: %v", err)
 			}
 			if err := os.WriteFile(path, out, 0o644); err != nil {
 				t.Fatal(err)

@@ -92,10 +92,14 @@ func TestAgainstFFprobe(t *testing.T) {
 		t.Run(fx.name, func(t *testing.T) {
 			path := filepath.Join(dir, fx.name)
 			if err := oracle.TryFFmpeg(append(append([]string{}, fx.args...), path)...); err != nil {
-				// Optional fixtures need a hardware or OS encoder; any
-				// fixture is skipped by an ffmpeg built without its encoder.
-				if fx.opt || strings.Contains(err.Error(), "Unknown encoder") {
+				// Optional fixtures need a hardware or OS encoder, which
+				// only some platforms have. An ffmpeg built without one
+				// of the others is an incomplete oracle.
+				if fx.opt {
 					t.Skipf("fixture not buildable here: %v", err)
+				}
+				if strings.Contains(err.Error(), "Unknown encoder") {
+					oracle.Missing(t, "fixture not buildable here: %v", err)
 				}
 				t.Fatal(err)
 			}

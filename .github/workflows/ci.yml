@@ -14,12 +14,17 @@ jobs:
     env:
       GOEXPERIMENT: ${{ matrix.variant == 'simd' && 'simd' || '' }}
       GOFLAGS: ${{ matrix.variant == 'purego' && '-tags=purego' || '' }}
+      # Where ffmpeg has every encoder the fixtures need (apt's and Homebrew's
+      # builds), a test that cannot run for want of the oracle fails rather
+      # than skips, so it cannot stop running unnoticed. Windows only lists
+      # what it skipped: Chocolatey's build has not been checked for them.
+      GOVIDEO_ORACLE_STRICT: ${{ !startsWith(matrix.os, 'windows') && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: '1.27'
-      # ffmpeg/ffprobe are black-box test oracles only (SPEC §11); tests skip without them.
+      # ffmpeg/ffprobe are black-box test oracles only (SPEC §11).
       - name: Install ffmpeg (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -33,4 +38,6 @@ jobs:
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)"
       - run: go vet ./...
-      - run: go test ./...
+      # go test, plus a list of the tests that skipped and why, in the log
+      # and in the job summary.
+      - run: go run ./internal/testreport ./...

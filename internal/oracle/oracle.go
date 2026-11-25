@@ -1,7 +1,8 @@
 // Package oracle is a test-only harness that runs locally installed ffmpeg
 // and ffprobe binaries as black-box oracles (SPEC §11). The binaries are
 // never vendored and their source is never read; tests skip when they are
-// not installed. Nothing outside _test files may import this package.
+// not installed, or fail if StrictEnv is set. Nothing outside _test files
+// may import this package.
 package oracle
 
 import (
@@ -9,18 +10,45 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
 )
 
-// Require skips the test unless ffmpeg and ffprobe are on PATH.
+// StrictEnv names the environment variable that, set to anything but "" or
+// "0", makes a test fail where it would skip because the oracle lacks
+// something. CI sets it on the runners whose ffmpeg is known to be complete,
+// so that a test cannot stop running without anyone noticing.
+const StrictEnv = "GOVIDEO_ORACLE_STRICT"
+
+// Strict reports whether a missing oracle fails tests (see StrictEnv).
+func Strict() bool {
+	v := os.Getenv(StrictEnv)
+	return v != "" && v != "0"
+}
+
+// Missing ends a test that cannot run because the oracle is not installed,
+// lacks an encoder, or cannot make a fixture: with a skip, or with a failure
+// when Strict. Every skip of that kind goes through here; a skip for any
+// other reason (no system codecs on this platform, an encoder only one
+// platform has) calls t.Skip itself and stays a skip.
+func Missing(t testing.TB, format string, args ...any) {
+	t.Helper()
+	if Strict() {
+		t.Fatalf(format+" ("+StrictEnv+" is set: the oracle must be complete here)", args...)
+	}
+	t.Skipf(format, args...)
+}
+
+// Require ends the test, as Missing does, unless ffmpeg and ffprobe are on
+// PATH.
 func Require(t testing.TB) {
 	t.Helper()
 	for _, bin := range []string{"ffmpeg", "ffprobe"} {
 		if _, err := exec.LookPath(bin); err != nil {
-			t.Skipf("%s not installed; skipping oracle test", bin)
+			Missing(t, "%s is not installed: no oracle to test against", bin)
 		}
 	}
 }
