@@ -100,7 +100,7 @@ func TestDeinterlaceH264(t *testing.T) {
 			"-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-pix_fmt", "yuv420p", "-bf", "2",
 			"-flags", "+ildct+ilme", "-x264-params", scan + "=1", "-an"}, videoColour...)
 		if err := oracle.TryFFmpeg(append(args, in)...); err != nil {
-			t.Skipf("the oracle cannot make this fixture: %v", err)
+			oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 		}
 		return in
 	}
@@ -157,14 +157,14 @@ func TestDeinterlaceH264(t *testing.T) {
 			"-c:v", "libx264", "-preset", "veryfast", "-crf", "10", "-pix_fmt", "yuv420p",
 			"-x264-params", "fake-interlaced=1", "-an"}, videoColour...)
 		if err := oracle.TryFFmpeg(append(args, in)...); err != nil {
-			t.Skipf("the oracle cannot make this fixture: %v", err)
+			oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 		}
 		info, err := videoprobe.ProbeFile(context.Background(), in)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !info.Streams[0].Video.Interlaced {
-			t.Skip("the oracle's encoder did not mark the stream as allowing fields")
+			oracle.Missing(t, "the oracle's encoder did not mark the stream as allowing fields")
 		}
 		frames := exportClip(t, in, 25, govideo.ClipOptions{})
 		if len(frames) != cardFields/2 {
@@ -183,7 +183,7 @@ func TestDeinterlaceH264(t *testing.T) {
 		args := append([]string{"-i", card, "-vf", toVideoRange + "interlace=scan=tff:lowpass=off",
 			"-c:v", "libx264", "-preset", "veryfast", "-crf", "10", "-pix_fmt", "yuv420p", "-an"}, videoColour...)
 		if err := oracle.TryFFmpeg(append(args, in)...); err != nil {
-			t.Skipf("the oracle cannot make this fixture: %v", err)
+			oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 		}
 		for i, f := range exportClip(t, in, 25, govideo.ClipOptions{}) {
 			if !combed(f) {
@@ -203,7 +203,7 @@ func TestDeinterlaceForcedMJPEG(t *testing.T) {
 	card := fieldCard(t, dir)
 	in := filepath.Join(dir, "fields.mov")
 	if err := oracle.TryFFmpeg("-i", card, "-vf", "interlace=scan=bff:lowpass=off", "-c:v", "mjpeg", "-q:v", "2", "-an", in); err != nil {
-		t.Skipf("the oracle cannot make this fixture: %v", err)
+		oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 	}
 	checkFields(t, exportClip(t, in, 50, govideo.ClipOptions{Deinterlace: govideo.DeinterlaceBottomFirst}), inOrder, cardFields)
 	frames := exportClip(t, in, 25, govideo.ClipOptions{})

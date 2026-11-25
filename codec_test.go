@@ -414,7 +414,7 @@ func TestDecodeOSCodecs(t *testing.T) {
 		t.Run(fx.name, func(t *testing.T) {
 			in := filepath.Join(dir, fx.name)
 			if err := oracle.TryFFmpeg(cat([]string{"-i", src}, fx.args, []string{in})...); err != nil {
-				t.Skipf("the oracle cannot make this fixture: %v", err)
+				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 			}
 			out := filepath.Join(dir, fx.name+".out.mov")
 			transcode(t, in, out, govideo.TimeRange{}, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
@@ -444,7 +444,7 @@ func TestConcatMixedCodecs(t *testing.T) {
 		"-c:v", "mjpeg", "-q:v", "3", p("green.mov"))
 	if err := oracle.TryFFmpeg("-f", "lavfi", "-i", "color=c=0x0000ff:s=640x480:r=25:d=1", "-f", "lavfi", "-i", "sine=f=880:d=1:r=48000",
 		"-c:v", "libx265", "-pix_fmt", "yuv420p", "-tag:v", "hvc1", "-x265-params", "log-level=error", "-c:a", "aac", p("blue.mp4")); err != nil {
-		t.Skipf("the oracle has no HEVC encoder: %v", err)
+		oracle.Missing(t, "the oracle has no HEVC encoder: %v", err)
 	}
 	tl := govideo.NewTimeline(govideo.Canvas{Width: 640, Height: 360, FrameRate: govideo.R(30, 1)})
 	tl.AddClip(p("red.mp4"), govideo.ClipOptions{})
@@ -528,7 +528,7 @@ func TestDecodeAVI(t *testing.T) {
 				args = []string{"-c:v", "mjpeg", "-q:v", "2", "-huffman", "default", "-bsf:v", "mjpegadump", "-c:a", "pcm_s16le"}
 			}
 			if err := oracle.TryFFmpeg(append(append([]string{"-i", src}, args...), in)...); err != nil {
-				t.Skipf("the oracle cannot make this fixture: %v", err)
+				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 			}
 			out := filepath.Join(dir, fx.name+".mov")
 			transcode(t, in, out, govideo.TimeRange{}, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})

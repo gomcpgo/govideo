@@ -120,7 +120,7 @@ func TestDecoderReuse(t *testing.T) {
 			"-c:v", "libx264", "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p",
 			"-bf", "3", "-refs", "4", "-g", "20", "-x264-params", "open-gop=1:b-pyramid=strict:b-adapt=0:scenecut=0",
 			"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-an", in); err != nil {
-			t.Skipf("the oracle cannot make this fixture: %v", err)
+			oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 		}
 		cuts := []cut{{in, 51, 60}, {in, 5, 15}, {in, 70, 80}, {in, 45, 52}}
 		sessions, reused := exportCuts(t, cuts)

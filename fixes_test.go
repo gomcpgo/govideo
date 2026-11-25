@@ -3,7 +3,6 @@ package govideo_test
 import (
 	"context"
 	"errors"
-	"image/color"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,7 +26,7 @@ func TestMirroredDisplayMatrix(t *testing.T) {
 	exportCard(t, src, 30, govideo.ExportOptions{Profile: govideo.ProfileIntermediate})
 	in := filepath.Join(dir, "flipped.mov")
 	if err := oracle.TryFFmpeg("-display_hflip", "-i", src, "-c", "copy", in); err != nil {
-		t.Skipf("the oracle cannot write a reflecting display matrix: %v", err)
+		oracle.Missing(t, "the oracle cannot write a reflecting display matrix: %v", err)
 	}
 	info, err := videoprobe.ProbeFile(context.Background(), in)
 	if err != nil {
@@ -101,7 +100,7 @@ func TestTruncatedFileTrim(t *testing.T) {
 	whole := filepath.Join(dir, "whole.mp4")
 	if err := oracle.TryFFmpeg("-i", src, "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p",
 		"-g", "10", "-bf", "0", "-an", "-movflags", "+faststart", whole); err != nil {
-		t.Skipf("the oracle cannot make this fixture: %v", err)
+		oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 	}
 	data, err := os.ReadFile(whole)
 	if err != nil {
@@ -148,7 +147,7 @@ func TestSeekOpenGOP(t *testing.T) {
 				"-c:v", "libx264", "-profile:v", "main", "-preset", "medium", "-crf", "16", "-pix_fmt", "yuv420p",
 				"-flags", "+ildct+ilme", "-bf", "3", "-refs", "4", "-g", "20", "-x264-params", "open-gop=1:b-pyramid=strict:b-adapt=0",
 				"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-an", in); err != nil {
-				t.Skipf("the oracle cannot make this fixture: %v", err)
+				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 			}
 			out := filepath.Join(dir, name+".out.mov")
 			transcode(t, in, out, govideo.Range(1700*time.Millisecond, 2500*time.Millisecond),
@@ -173,7 +172,7 @@ func TestEditListPreroll(t *testing.T) {
 		"-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=tv:out_color_matrix=bt709",
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-pix_fmt", "yuv420p", "-bf", "2", "-g", "20",
 		"-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv", "-an", whole); err != nil {
-		t.Skipf("the oracle cannot make this fixture: %v", err)
+		oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 	}
 	// Keyframes at frames 20 and 40; the copy starts at frame 30.
 	in := filepath.Join(dir, "cut.mp4")
@@ -210,7 +209,7 @@ func TestMultichannelAACOrder(t *testing.T) {
 			in := filepath.Join(dir, c.layout+c.channel+".m4a")
 			if err := oracle.TryFFmpeg("-f", "lavfi", "-i", "sine=f=440:d=2:r=48000", "-af", "pan="+c.layout+"|"+c.channel+"=c0",
 				"-c:a", "aac", "-b:a", "256k", in); err != nil {
-				t.Skipf("the oracle cannot make %s AAC: %v", c.layout, err)
+				oracle.Missing(t, "the oracle cannot make %s AAC: %v", c.layout, err)
 			}
 			tl := govideo.NewTimeline(govideo.Canvas{Width: 320, Height: 180, FrameRate: govideo.R(30, 1)})
 			tl.AddGenerated(2*time.Second, govideo.GenerateOptions{})
@@ -249,12 +248,7 @@ func TestMultichannelAACOrder(t *testing.T) {
 func TestWebPRange(t *testing.T) {
 	oracle.Require(t)
 	dir := t.TempDir()
-	png := filepath.Join(dir, "in.png")
-	writePNG(t, png, 64, 64, color.White)
-	webp := filepath.Join(dir, "white.webp")
-	if err := oracle.TryFFmpeg("-i", png, "-c:v", "libwebp", "-lossless", "0", "-quality", "95", webp); err != nil {
-		t.Skipf("the oracle has no WebP encoder: %v", err)
-	}
+	webp, _ := writeWebP(t, dir, "white.webp", whiteWebP)
 	tl := govideo.NewTimeline(govideo.Canvas{Width: cardW, Height: cardH, FrameRate: govideo.R(cardFPS, 1)})
 	tl.AddImage(webp, time.Second/2, govideo.ImageOptions{})
 	out := filepath.Join(dir, "out.mov")
