@@ -240,6 +240,55 @@ func (s *wavSink) finish(int64) error {
 
 func (s *wavSink) close() {}
 
+// flacSink writes an audio-only export as a FLAC file: 16-bit samples,
+// compressed without loss by the module's own encoder. The header goes in
+// again at the end, when the length and the checksum of the sound are known.
+type flacSink struct {
+	f   *os.File
+	w   *bufio.Writer
+	enc *native.FLACEncoder
+}
+
+// newFLACSink starts a FLAC file in f, which must be empty.
+func newFLACSink(f *os.File, rate, channels int) (*flacSink, error) {
+	enc, err := native.NewFLACEncoder(rate, channels)
+	if err != nil {
+		return nil, err
+	}
+	s := &flacSink{f: f, w: bufio.NewWriterSize(f, 1<<18), enc: enc}
+	if _, err := s.w.Write(enc.Header()); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *flacSink) emit(frames [][]byte, err error) error {
+	if err != nil {
+		return err
+	}
+	for _, f := range frames {
+		if _, err := s.w.Write(f); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *flacSink) write(samples []float32) error { return s.emit(s.enc.Encode(samples)) }
+
+func (s *flacSink) finish(int64) error {
+	if err := s.emit(s.enc.Flush()); err != nil {
+		return err
+	}
+	if err := s.w.Flush(); err != nil {
+		return err
+	}
+	_, err := s.f.WriteAt(s.enc.Header(), 0)
+	return err
+}
+
+func (s *flacSink) close() {}
+
 // outputs creates the tracks of an export for one profile.
 type outputs struct {
 	profile Profile

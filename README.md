@@ -8,7 +8,7 @@ go get github.com/gomcpgo/govideo
 
 Requires Go 1.27 or later. No cgo.
 
-> **Status: phase 1 in progress.** On **macOS**, H.264, HEVC and AAC are decoded through the system codecs (VideoToolbox, AudioToolbox), and the widely playable **H.264 + AAC** export works. On Windows the system codec backend is not written yet, and Linux has no system codecs, so there only Motion JPEG and LPCM work for now. The native VP8/VP9/AV1/Opus codecs are not written yet. See [Roadmap](#roadmap).
+> **Status: phase 1 in progress.** On **macOS**, H.264, HEVC and AAC are decoded through the system codecs (VideoToolbox, AudioToolbox), and the widely playable **H.264 + AAC** export works. On Windows the system codec backend is not written yet, and Linux has no system codecs, so there only Motion JPEG and LPCM work for now, with FLAC as an audio output. The native VP8/VP9/AV1/Opus codecs are not written yet. See [Roadmap](#roadmap).
 
 ## Inspecting media: `videoprobe`
 
@@ -100,12 +100,13 @@ What works today:
   - `ProfileAuto` (the default) picks `ProfileCompatible` when the system has the encoders, else `ProfileIntermediate`.
 - **Audio-only export** (`ExportAudio`): the timeline's sound as a file, at a sample rate and channel count of your choosing (48 kHz stereo unless you say otherwise; one channel is the two mixed to mono). No picture is decoded, so it is fast, and a clip gives its sound even where its video has no decoder.
   - `.wav`: 16-bit PCM, on every platform. Up to 4 GB, which is 37 hours at 16 kHz mono and 6 hours at 48 kHz stereo.
+  - `.flac`: the same 16-bit samples compressed without loss, by an encoder written in Go, on every platform. About half the size of the `.wav`, less for clean sound: speech at 16 kHz mono takes a little over 1 MB a minute. Every sample decodes exactly as it went in; the file carries a checksum of them.
   - `.m4a`: AAC-LC from the system encoder. macOS only for now. `Bitrate` is taken to the nearest rate the encoder has for the layout; left at 0, the encoder chooses (24 kbit/s for 16 kHz mono, about 11 MB an hour; 128 kbit/s for 48 kHz stereo).
   - The file is as long as the timeline to the sample, and segments start and end on the sample nearest their time, not on a frame of the canvas. An `AddAudio` file in `Track` mode, which is a separate track of a video, is left out.
 
 Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; deinterlacing rebuilds each field on its own, so a stream marked interlaced whose pictures are not loses vertical detail (set `ClipOptions.Deinterlace` to `DeinterlaceOff` for such a clip, or to a field order for an interlaced stream that is not marked); H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
-Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A bare MP3 file is one of these for now: `videoprobe` reads it, but there is no MP3 decoder yet. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
+Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A bare MP3 file is one of these for now: `videoprobe` reads it, but there is no MP3 decoder yet. So is a FLAC file: govideo writes them but cannot read them yet. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
 ## Codec policy
 
@@ -123,7 +124,7 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`, audio-only export (`ExportAudio`). To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`, audio-only export (`ExportAudio`), a native FLAC encoder. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |

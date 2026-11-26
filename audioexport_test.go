@@ -1,7 +1,9 @@
 package govideo_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -13,15 +15,18 @@ import (
 	"time"
 
 	"github.com/gomcpgo/govideo"
+	"github.com/gomcpgo/govideo/codec/native"
+	"github.com/gomcpgo/govideo/internal/codechdr"
 	"github.com/gomcpgo/govideo/internal/container/wav"
 	"github.com/gomcpgo/govideo/internal/oracle"
 	"github.com/gomcpgo/govideo/videoprobe"
 )
 
 // The audio-only export is tested, as far as it can be, without the oracle:
-// a WAVE file is read back by the module's own parser, and an .m4a through
-// the module's own decoders, so the tests run where ffmpeg is not installed
-// and (for WAVE) where there are no system codecs.
+// a WAVE file is read back by the module's own parser, an .m4a through the
+// module's own decoders, and a FLAC file is held to the WAVE file of the
+// same sound, so the tests run where ffmpeg is not installed and (for WAVE
+// and FLAC) where there are no system codecs.
 
 // writeTone writes a 16-bit WAVE file sec long holding a sine of freq Hz,
 // with one channel for each level given: the peak of that channel's sine, 1
@@ -433,6 +438,137 @@ func TestExportAudioM4A(t *testing.T) {
 	}
 }
 
+// TestExportAudioFLAC writes each layout as WAVE and as FLAC. FLAC is
+// lossless, so the two must hold the same samples, and that is checked
+// three ways. The checksum in the FLAC header is that of the WAVE file's
+// samples. The file is, byte for byte, the header and frames the encoder
+// gives for those samples, and the encoder's own tests decode such frames
+// back to what went in (codec/native). And where the oracle is installed,
+// ffmpeg decodes the file to the WAVE file's samples.
+func TestExportAudioFLAC(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	src := filepath.Join(dir, "src.wav")
+	writeTone(t, src, 44100, 2, 330, 0.6, 0.2) // louder on the left
+	tl := govideo.NewTimeline(govideo.Canvas{})
+	tl.AddClip(src, govideo.ClipOptions{})
+	tl.AddGenerated(300*time.Millisecond, govideo.GenerateOptions{})
+	tl.AddGenerated(1210500*time.Microsecond, govideo.GenerateOptions{Tone: 1000, Beep: true})
+	tl.AddGenerated(700*time.Millisecond, govideo.GenerateOptions{Tone: 440, Transition: govideo.Transition{Duration: 300 * time.Millisecond}})
+	const total48 = 187704 // 3.9105 s
+
+	for _, c := range []struct{ rate, channels int }{
+		{0, 0},     // the defaults: 48 kHz stereo
+		{16000, 1}, // for speech recognition
+		{44100, 2},
+		{22050, 1},
+		{96000, 2},
+		{37000, 1}, // a rate the frame header has no code for
+	} {
+		rate, channels := c.rate, c.channels
+		if rate == 0 {
+			rate, channels = 48000, 2
+		}
+		t.Run(fmt.Sprintf("%d Hz, %d channels", rate, channels), func(t *testing.T) {
+			name := fmt.Sprintf("%d-%d", rate, channels)
+			o := govideo.AudioExportOptions{SampleRate: c.rate, Channels: c.channels}
+			ref := exportAudio(t, tl, filepath.Join(dir, name+".wav"), o)
+			frames := (total48*rate + 24000) / 48000
+			if ref.frames() != frames || ref.rate != rate || ref.channels != channels {
+				t.Fatalf("the WAVE export has %d frames at %d Hz in %d channels, want %d at %d Hz in %d",
+					ref.frames(), ref.rate, ref.channels, frames, rate, channels)
+			}
+			wave, err := os.ReadFile(filepath.Join(dir, name+".wav"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			pcm := wave[wav.HeaderSize:]
+
+			path := filepath.Join(dir, name+".flac")
+			var last govideo.Progress
+			o.Progress = func(p govideo.Progress) { last = p }
+			if err := tl.ExportAudio(ctx, path, o); err != nil {
+				t.Fatal(err)
+			}
+			if last.Frame != int64(frames) || last.TotalFrames != int64(frames) {
+				t.Errorf("last progress call %+v, want frame %d of %d", last, frames, frames)
+			}
+			file, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(file) < native.FLACHeaderSize || string(file[:4]) != "fLaC" {
+				t.Fatalf("%d bytes, starting %q", len(file), file[:min(4, len(file))])
+			}
+			a, err := codechdr.ParseFLACStreamInfo(file[:native.FLACHeaderSize])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if a.SampleRate != rate || a.Channels != channels || a.BitDepth != 16 || a.TotalSamples != int64(frames) {
+				t.Errorf("STREAMINFO: %d samples of %d bits at %d Hz in %d channels, want %d of 16 bits at %d Hz in %d",
+					a.TotalSamples, a.BitDepth, a.SampleRate, a.Channels, frames, rate, channels)
+			}
+			if got, want := file[native.FLACHeaderSize-16:native.FLACHeaderSize], md5.Sum(pcm); !bytes.Equal(got, want[:]) {
+				t.Errorf("STREAMINFO MD5 %x; the WAVE file's samples have %x", got, want)
+			}
+
+			// The frames of those samples, from the encoder directly.
+			enc, err := native.NewFLACEncoder(rate, channels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			in := make([]float32, len(pcm)/2)
+			for i := range in {
+				in[i] = float32(int16(binary.LittleEndian.Uint16(pcm[2*i:]))) / 32767
+			}
+			var body []byte
+			for _, step := range []func() ([][]byte, error){func() ([][]byte, error) { return enc.Encode(in) }, enc.Flush} {
+				packets, err := step()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, p := range packets {
+					body = append(body, p...)
+				}
+			}
+			if want := append(enc.Header(), body...); !bytes.Equal(file, want) {
+				t.Errorf("the file (%d bytes) is not the header and frames of the WAVE file's samples (%d bytes)", len(file), len(want))
+			}
+			if len(file) > len(pcm)/2 {
+				t.Errorf("%d bytes for %d of PCM: tones should compress to less than half", len(file), len(pcm))
+			}
+			t.Logf("%d bytes, %.3f of the PCM", len(file), float64(len(file))/float64(len(pcm)))
+
+			t.Run("oracle", func(t *testing.T) {
+				oracle.Require(t)
+				r := oracle.FFprobe(t, path)
+				if len(r.Streams) != 1 {
+					t.Fatalf("ffprobe: %d streams", len(r.Streams))
+				}
+				fs := r.Streams[0]
+				dur, _ := oracle.Seconds(fs.Duration)
+				if r.Format.FormatName != "flac" || fs.CodecName != "flac" || fs.SampleRate != fmt.Sprint(rate) || fs.Channels != channels ||
+					!within(dur, float64(frames)/float64(rate), 1e-5) {
+					t.Errorf("ffprobe: %s, %s at %s Hz in %d channels, %s s; want flac at %d Hz in %d channels, %.6f s",
+						r.Format.FormatName, fs.CodecName, fs.SampleRate, fs.Channels, fs.Duration, rate, channels, float64(frames)/float64(rate))
+				}
+				if raw := oracle.FFmpegOutput(t, "-i", path, "-c:a", "pcm_s16le", "-f", "s16le", "-"); !bytes.Equal(raw, pcm) {
+					t.Errorf("ffmpeg decodes %d bytes that are not the %d of the WAVE file", len(raw), len(pcm))
+				}
+			})
+		})
+	}
+
+	// What is written cannot be read back yet: there is no FLAC decoder,
+	// and the error says so.
+	back := govideo.NewTimeline(govideo.Canvas{})
+	back.AddClip(filepath.Join(dir, "16000-1.flac"), govideo.ClipOptions{})
+	var cu *govideo.ErrCodecUnavailable
+	if err := back.ExportAudio(ctx, filepath.Join(dir, "back.wav"), govideo.AudioExportOptions{}); !errors.As(err, &cu) || cu.Codec != "flac" || cu.Op != govideo.Decode {
+		t.Errorf("a FLAC file as a clip: %v, want ErrCodecUnavailable for flac decode", err)
+	}
+}
+
 // TestExportAudioErrors checks what ExportAudio refuses, and that a refusal
 // or a cancelled export leaves no file behind.
 func TestExportAudioErrors(t *testing.T) {
@@ -459,8 +595,8 @@ func TestExportAudioErrors(t *testing.T) {
 		o    govideo.AudioExportOptions
 		want string // part of the message
 	}{
-		{"a format there is no encoder for", tone(time.Second), "a.mp3", govideo.AudioExportOptions{}, ".wav or .m4a"},
-		{"a video extension", tone(time.Second), "a.mp4", govideo.AudioExportOptions{}, ".wav or .m4a"},
+		{"a format there is no encoder for", tone(time.Second), "a.mp3", govideo.AudioExportOptions{}, ".wav, .flac or .m4a"},
+		{"a video extension", tone(time.Second), "a.mp4", govideo.AudioExportOptions{}, ".wav, .flac or .m4a"},
 		{"three channels", tone(time.Second), "a.wav", govideo.AudioExportOptions{Channels: 3}, "1 or 2 channels"},
 		{"a negative channel count", tone(time.Second), "a.wav", govideo.AudioExportOptions{Channels: -1}, "1 or 2 channels"},
 		{"a sample rate too low", tone(time.Second), "a.wav", govideo.AudioExportOptions{SampleRate: 500}, "sample rate"},
