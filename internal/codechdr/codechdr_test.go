@@ -230,6 +230,12 @@ var parsers = []parser{
 	{"DOps", aud(ParseDOps), []string{seedDOps, seedDOps51}},
 	{"FLACStreamInfo", aud(ParseFLACStreamInfo), []string{seedFLAC, seedDFLA, seedFLAC[16:]}},
 	{"MPEGAudioHeader", aud(ParseMPEGAudioHeader), []string{seedMP3}},
+	{"FLACFrameHeader", func(b []byte) error {
+		if _, ok := FLACFrameHeader(b); !ok {
+			return invalid("FLAC frame header")
+		}
+		return nil
+	}, []string{seedFLACFrame1, seedFLACFrame2, seedFLACFrame3, seedFLACFrame4}},
 	{"DOVIConfig", func(b []byte) error { _, err := ParseDOVIConfig(b); return err }, []string{seedDOVI}},
 	{"Colr", func(b []byte) error { ParseColr(b); return nil }, []string{seedColrNCLX}},
 }
@@ -305,5 +311,6 @@ func FuzzOpusHead(f *testing.F)            { fuzz(f, "OpusHead") }
 func FuzzDOps(f *testing.F)                { fuzz(f, "DOps") }
 func FuzzFLACStreamInfo(f *testing.F)      { fuzz(f, "FLACStreamInfo") }
 func FuzzMPEGAudioHeader(f *testing.F)     { fuzz(f, "MPEGAudioHeader") }
+func FuzzFLACFrameHeader(f *testing.F)     { fuzz(f, "FLACFrameHeader") }
 func FuzzDOVIConfig(f *testing.F)          { fuzz(f, "DOVIConfig") }
 func FuzzColr(f *testing.F)                { fuzz(f, "Colr") }

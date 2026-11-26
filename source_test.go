@@ -164,6 +164,14 @@ func TestAudioSeek(t *testing.T) {
 		{"mp3.mp4", append(tone, "-c:a", "libmp3lame", "-b:a", "64k"), false},
 		{"mp3.mkv", append(tone, "-c:a", "libmp3lame", "-b:a", "64k"), false},
 		{"mp3.mov", append(append(picture, tone...), "-c:v", "mjpeg", "-c:a", "libmp3lame", "-b:a", "96k"), false},
+		// A FLAC frame stands alone, and a bare file has no index: a frame
+		// is found by its number.
+		{"s16.flac", append(tone, "-c:a", "flac"), false},
+		{"s24.flac", append(tone, "-c:a", "flac", "-sample_fmt", "s32", "-ar", "96000"), false},
+		{"small_blocks.flac", append(tone, "-c:a", "flac", "-frame_size", "256", "-ac", "1"), false},
+		{"large_blocks.flac", append(tone, "-c:a", "flac", "-frame_size", "16384"), false},
+		{"flac.mp4", append(append(picture, tone...), "-c:v", "mjpeg", "-c:a", "flac", "-strict", "-2"), false},
+		{"flac.mkv", append(tone, "-c:a", "flac"), false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if c.os && !BuildInfo().OSBackend {

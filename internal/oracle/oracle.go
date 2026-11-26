@@ -126,6 +126,7 @@ type Stream struct {
 	Channels      int               `json:"channels"`
 	ChannelLayout string            `json:"channel_layout"`
 	BitsPerSample int               `json:"bits_per_sample"`
+	BitsPerRaw    string            `json:"bits_per_raw_sample"`
 	Tags          map[string]string `json:"tags"`
 	Disposition   map[string]int    `json:"disposition"`
 	SideData      []map[string]any  `json:"side_data_list"`

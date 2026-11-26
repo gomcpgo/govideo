@@ -23,6 +23,7 @@ import (
 	"github.com/gomcpgo/govideo/codec/oscodec"
 	"github.com/gomcpgo/govideo/internal/codechdr"
 	"github.com/gomcpgo/govideo/internal/container/avi"
+	"github.com/gomcpgo/govideo/internal/container/flac"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/mp3"
@@ -54,6 +55,7 @@ type media struct {
 	wv   *wav.File
 	avi  *avi.File
 	mp3  *mp3.File
+	flac *flac.File
 }
 
 func openMedia(ctx context.Context, path string) (*media, error) {
@@ -75,7 +77,7 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		// and is reported as one.
 		var uf *videoprobe.UnsupportedFormatError
 		if errors.As(err, &uf) {
-			if id, ok := map[string]CodecID{"flac": "flac", "ac3": "ac3"}[uf.Format]; ok {
+			if id, ok := map[string]CodecID{"ac3": "ac3"}[uf.Format]; ok {
 				if _, cerr := Available(id, Decode); cerr != nil {
 					return fail(cerr)
 				}
@@ -96,6 +98,10 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 		// videoprobe measures layers I and II too, which have no decoder.
 		if _, err = Available(CodecID(m.info.Streams[0].Codec), Decode); err == nil {
 			m.mp3, err = mp3.Open(ctx, f, st.Size())
+		}
+	case "flac":
+		if _, err = Available("flac", Decode); err == nil {
+			m.flac, err = flac.Open(ctx, f, st.Size())
 		}
 	default:
 		err = fmt.Errorf("unsupported container %q", m.info.Format)
@@ -174,6 +180,8 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 		return &wavReader{f: m.f, w: m.wv}, nil
 	case m.mp3 != nil:
 		return newMP3Reader(m.f, m.mp3), nil
+	case m.flac != nil:
+		return &flacReader{f: m.flac, rd: m.flac.NewReader(m.f)}, nil
 	case m.avi != nil:
 		for _, t := range m.avi.Streams {
 			if int64(t.Index) == s.ID {
@@ -185,9 +193,12 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 }
 
 // config returns the codec configuration of stream s: the named child box of
-// its MP4 sample entry, or the Matroska CodecPrivate.
+// its MP4 sample entry, the Matroska CodecPrivate, or the STREAMINFO block of
+// a FLAC file.
 func (m *media) config(s *videoprobe.Stream, box string) []byte {
 	switch {
+	case m.flac != nil:
+		return m.flac.StreamInfo
 	case m.iso != nil:
 		for _, t := range m.iso.Tracks {
 			if int64(t.ID) == s.ID && len(t.Entries) > 0 {
@@ -483,6 +494,26 @@ func (r *mp3Reader) seekAudio(n int64) (passed int64) {
 	return r.n
 }
 
+// flacReader reads the frames of a bare FLAC file.
+type flacReader struct {
+	f  *flac.File
+	rd *flac.Reader
+}
+
+func (r *flacReader) next() (packet, error) {
+	data, err := r.rd.Next()
+	if err != nil {
+		return packet{}, err
+	}
+	// A frame says where in the stream its samples start.
+	pts := time.Duration(float64(r.f.FirstSample(data)) / float64(r.f.SampleRate) * 1e9)
+	return packet{pts: pts, data: data, sync: true}, nil
+}
+
+// seekAudio goes to a frame by its number: it reads a few places in the
+// file, not the frames before.
+func (r *flacReader) seekAudio(n int64) (passed int64) { return r.rd.Skip(n) }
+
 // --- audio -------------------------------------------------------------------
 
 // audioStream delivers a source audio stream as 48 kHz stereo float32.
@@ -525,6 +556,8 @@ func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
 		return native.NewPCMDecoder(s.Codec, s.Audio.Channels, s.Audio.SampleRate)
 	case "mp3":
 		return native.NewMP3Decoder(), nil
+	case "flac":
+		return native.NewFLACDecoder(m.config(s, "dfLa"))
 	}
 	cfg := m.config(s, "esds")
 	if m.iso != nil {
@@ -595,8 +628,22 @@ func (a *audioStream) seek(ctx context.Context, m *media, s *videoprobe.Stream, 
 	// container's rate (576 of MP3): a cut inside the run-in is not looked
 	// at further.
 	runIn, shortest := int64(audioRunIn), int64(960)
-	if s.Codec == "mp3" {
+	var block int64 // FLAC: the sample frames of every packet but the last
+	switch s.Codec {
+	case "mp3":
 		runIn, shortest = mp3RunIn(s.Audio.SampleRate, s.Audio.Channels), 576
+	case "flac":
+		// A FLAC frame stands alone, so there is no decoder to run in, only
+		// the resampler, as for PCM. Its packets are counted, which says
+		// where the sound is when they all hold the same number of samples;
+		// a stream of blocks of varying size is decoded from its start.
+		a, err := codechdr.ParseFLACStreamInfo(m.config(s, "dfLa"))
+		if err != nil || a.FrameSize < 1 {
+			return
+		}
+		block = int64(a.FrameSize)
+		runIn = (int64(pcmRunIn.Seconds()*float64(s.Audio.SampleRate))+block-1)/block + 1
+		shortest = block
 	}
 	if !pcm && trim < time.Duration(runIn*shortest)*time.Second/time.Duration(s.Audio.SampleRate) {
 		return
@@ -631,6 +678,9 @@ func (a *audioStream) seek(ctx context.Context, m *media, s *videoprobe.Stream, 
 		// as the first. One with packets of several lengths (Opus, Vorbis)
 		// will need its reader to count samples.
 		per = int64(len(fr.Samples) / fr.Channels)
+		if block > 0 && per != block {
+			return // the only frame of the stream, or not the stream STREAMINFO describes
+		}
 		if m.mkv != nil {
 			for _, t := range m.mkv.Tracks {
 				if int64(t.Number) == s.ID {

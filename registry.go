@@ -212,9 +212,10 @@ func init() {
 		Chroma: []Chroma{Chroma420, Chroma422, Chroma444}})
 	register(CodecInfo{ID: "mp3", Kind: Audio, Backend: Native, PatentClass: Expired,
 		CanDecode: true, MaxBitDepth: 16})
-	// FLAC is written (audio-only export) but not yet read.
+	// FLAC is read at every sample size it has; what is written (audio-only
+	// export) has 16 bits.
 	register(CodecInfo{ID: "flac", Kind: Audio, Backend: Native, PatentClass: RoyaltyFree,
-		CanEncode: true, MaxBitDepth: 16})
+		CanDecode: true, CanEncode: true, MaxBitDepth: 32})
 	// Patent-pooled codecs exist only where the operating system has them
 	// (SPEC §4.1, §6). 10-bit HEVC is decoded to 8 bits by the system.
 	if oscodec.Load() == nil {

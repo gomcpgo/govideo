@@ -37,6 +37,11 @@ type flacDecoded struct {
 	assign               []int   // the channel assignment of each
 	kinds                map[string]int
 	inSubset, rateInHead bool
+	// emptyPartition reports a first partition that holds no residual: a
+	// block cut into partitions as long as the predictor's order. The
+	// standard asks for a longer one (§9.2.7); ffmpeg's encoder writes
+	// them, and decoders read them.
+	emptyPartition bool
 }
 
 // refCRC is a checksum of width bits with the polynomial poly, one bit at a
@@ -256,8 +261,11 @@ func decodeSubframe(t testing.TB, r *bits.Reader, d *flacDecoded, block, bps, nu
 		if partOrder > 8 {
 			d.inSubset = false
 		}
-		if block&(1<<uint(partOrder)-1) != 0 || block>>uint(partOrder) <= order && !(partOrder == 0 && block == order) {
+		if block&(1<<uint(partOrder)-1) != 0 || block>>uint(partOrder) < order {
 			t.Fatalf("frame %d: partition order %d for a block of %d with predictor order %d", number, partOrder, block, order)
+		}
+		if block>>uint(partOrder) == order && block > order {
+			d.emptyPartition = true
 		}
 		i := order
 		for p := 0; p < 1<<uint(partOrder); p++ {
@@ -402,6 +410,9 @@ func checkFLAC(t testing.TB, file []byte, rate, channels int, pcm []int16) flacD
 	}
 	if len(d.samples) != len(pcm) {
 		t.Fatalf("%d samples decoded, %d encoded", len(d.samples), len(pcm))
+	}
+	if d.emptyPartition {
+		t.Error("a first partition with no residual in it")
 	}
 	for i, v := range pcm {
 		if d.samples[i] != int32(v) {

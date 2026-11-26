@@ -360,13 +360,18 @@ func TestRegistry(t *testing.T) {
 		t.Error("hevc output is not offered")
 	}
 	var cu *govideo.ErrCodecUnavailable
-	// FLAC is written by the module itself, on every platform, and not
-	// read yet.
-	if ci, err := govideo.Available("flac", govideo.Encode); err != nil || ci.Backend != govideo.Native || ci.PatentClass != govideo.RoyaltyFree {
-		t.Errorf("flac encode: %+v, %v, want the native royalty-free encoder", ci, err)
+	// FLAC is written and read by the module itself, on every platform.
+	for _, op := range []govideo.Op{govideo.Encode, govideo.Decode} {
+		if ci, err := govideo.Available("flac", op); err != nil || ci.Backend != govideo.Native || ci.PatentClass != govideo.RoyaltyFree {
+			t.Errorf("flac %s: %+v, %v, want the native royalty-free codec", op, ci, err)
+		}
 	}
-	if _, err := govideo.Available("flac", govideo.Decode); !errors.As(err, &cu) || !strings.Contains(cu.Reason, "only encoding") || cu.Hint == "" {
-		t.Errorf("flac decode: %v, want ErrCodecUnavailable saying that only encoding is there, with a hint", err)
+	// MP3 is read and not written, and the error says so.
+	if _, err := govideo.Available("mp3", govideo.Decode); err != nil {
+		t.Errorf("mp3 decode: %v", err)
+	}
+	if _, err := govideo.Available("mp3", govideo.Encode); !errors.As(err, &cu) || !strings.Contains(cu.Reason, "only decoding") {
+		t.Errorf("mp3 encode: %v, want ErrCodecUnavailable saying that only decoding is there", err)
 	}
 	if _, err := govideo.Available("vp9", govideo.Decode); !errors.As(err, &cu) || cu.Reason == "" {
 		t.Errorf("vp9 decode: %v, want ErrCodecUnavailable with a reason", err)

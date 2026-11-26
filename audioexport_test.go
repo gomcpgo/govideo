@@ -25,8 +25,9 @@ import (
 // The audio-only export is tested, as far as it can be, without the oracle:
 // a WAVE file is read back by the module's own parser, an .m4a through the
 // module's own decoders, and a FLAC file is held to the WAVE file of the
-// same sound, so the tests run where ffmpeg is not installed and (for WAVE
-// and FLAC) where there are no system codecs.
+// same sound, as it is written and as the module reads it back, so the
+// tests run where ffmpeg is not installed and (for WAVE and FLAC) where
+// there are no system codecs.
 
 // writeTone writes a 16-bit WAVE file sec long holding a sine of freq Hz,
 // with one channel for each level given: the peak of that channel's sine, 1
@@ -440,11 +441,13 @@ func TestExportAudioM4A(t *testing.T) {
 
 // TestExportAudioFLAC writes each layout as WAVE and as FLAC. FLAC is
 // lossless, so the two must hold the same samples, and that is checked
-// three ways. The checksum in the FLAC header is that of the WAVE file's
+// four ways. The checksum in the FLAC header is that of the WAVE file's
 // samples. The file is, byte for byte, the header and frames the encoder
 // gives for those samples, and the encoder's own tests decode such frames
-// back to what went in (codec/native). And where the oracle is installed,
-// ffmpeg decodes the file to the WAVE file's samples.
+// back to what went in (codec/native). The module reads the file back as
+// it reads the WAVE file: the same description, and as a clip the same
+// sound, to the sample. And where the oracle is installed, ffmpeg decodes
+// the file to the WAVE file's samples.
 func TestExportAudioFLAC(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -539,6 +542,37 @@ func TestExportAudioFLAC(t *testing.T) {
 			}
 			t.Logf("%d bytes, %.3f of the PCM", len(file), float64(len(file))/float64(len(pcm)))
 
+			// Read back by the module: what the file is, and its sound as
+			// a clip, whole and cut, against the WAVE file's.
+			info, err := videoprobe.ProbeFile(ctx, path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s := info.Streams[0]; info.Format != "flac" || len(info.Streams) != 1 || s.Codec != "flac" || s.Audio.SampleRate != rate ||
+				s.Audio.Channels != channels || s.Audio.BitDepth != 16 || s.Frames != int64(frames+4095)/4096 ||
+				!within(info.Duration.Seconds(), float64(frames)/float64(rate), 1e-8) {
+				t.Errorf("probe: %s, %s, %d frames, %v, %+v; want flac of %d samples at %d Hz in %d channels",
+					info.Format, s.Codec, s.Frames, info.Duration, *s.Audio, frames, rate, channels)
+			}
+			for what, trim := range map[string]govideo.TimeRange{"whole": {}, "cut": govideo.Range(1700*time.Millisecond, 3100*time.Millisecond)} {
+				var back [2]pcmFile
+				for i, ext := range []string{".wav", ".flac"} {
+					clip := govideo.NewTimeline(govideo.Canvas{})
+					clip.AddClip(filepath.Join(dir, name+ext), govideo.ClipOptions{Trim: trim})
+					back[i] = exportAudio(t, clip, filepath.Join(dir, name+ext+"."+what+".wav"), govideo.AudioExportOptions{SampleRate: c.rate, Channels: c.channels})
+				}
+				if back[0].frames() != back[1].frames() || back[0].frames() == 0 {
+					t.Errorf("%s: %d frames from the FLAC file as a clip, %d from the WAVE file", what, back[1].frames(), back[0].frames())
+					continue
+				}
+				for i, v := range back[0].s {
+					if back[1].s[i] != v {
+						t.Errorf("%s: sample %d of the FLAC file as a clip is %v; the WAVE file's is %v", what, i, back[1].s[i], v)
+						break
+					}
+				}
+			}
+
 			t.Run("oracle", func(t *testing.T) {
 				oracle.Require(t)
 				r := oracle.FFprobe(t, path)
@@ -559,13 +593,88 @@ func TestExportAudioFLAC(t *testing.T) {
 		})
 	}
 
-	// What is written cannot be read back yet: there is no FLAC decoder,
-	// and the error says so.
-	back := govideo.NewTimeline(govideo.Canvas{})
-	back.AddClip(filepath.Join(dir, "16000-1.flac"), govideo.ClipOptions{})
-	var cu *govideo.ErrCodecUnavailable
-	if err := back.ExportAudio(ctx, filepath.Join(dir, "back.wav"), govideo.AudioExportOptions{}); !errors.As(err, &cu) || cu.Codec != "flac" || cu.Op != govideo.Decode {
-		t.Errorf("a FLAC file as a clip: %v, want ErrCodecUnavailable for flac decode", err)
+}
+
+// TestFLACSources takes the sound of FLAC files, bare and inside MP4 and
+// Matroska files, as a clip, as a trimmed clip and as added audio, and holds
+// it against ffmpeg's decode of each file: the same samples, as many, from
+// the first. The source is mono at 48 kHz, so nothing is resampled or mixed
+// on the way to the WAVE file, and its beeps leave no room for a slip of a
+// sample. The codec is lossless, so what is left between the two is the
+// rounding of the 16-bit WAVE file the sound is exported to.
+func TestFLACSources(t *testing.T) {
+	oracle.Require(t)
+	dir := t.TempDir()
+	src := []string{"-f", "lavfi", "-i", `aevalsrc=0.4*sin(2*PI*(300+200*t)*t)*lt(mod(t\,0.5)\,0.35):d=4:s=48000`}
+	for _, c := range []struct {
+		name string
+		args []string
+	}{
+		{"s16.flac", append(src, "-c:a", "flac", "-sample_fmt", "s16")},
+		{"s24.flac", append(src, "-c:a", "flac", "-sample_fmt", "s32")},
+		{"small_blocks.flac", append(src, "-c:a", "flac", "-frame_size", "300")},
+		{"large_blocks.flac", append(src, "-c:a", "flac", "-frame_size", "16384", "-compression_level", "12")},
+		{"tagged.flac", append(src, "-c:a", "flac", "-metadata", "title=a title", "-metadata", "artist=someone")},
+		{"flac.mp4", append(src, "-c:a", "flac", "-strict", "-2")},
+		{"flac.mkv", append(src, "-c:a", "flac")},
+		{"s24.mkv", append(src, "-c:a", "flac", "-sample_fmt", "s32")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(dir, c.name)
+			if err := oracle.TryFFmpeg(append(append([]string(nil), c.args...), path)...); err != nil {
+				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
+			}
+			want := oracle.Audio(t, path, "0:a:0")
+			if len(want) != 4*48000 {
+				t.Fatalf("the oracle decodes %d samples of a 4 s file", len(want))
+			}
+			mono := govideo.AudioExportOptions{SampleRate: 48000, Channels: 1}
+			// differs is the largest difference between got, from sample at
+			// on, and the oracle's samples from sample from on.
+			differs := func(got pcmFile, at, from, n int) float64 {
+				if at+n > got.frames() || from+n > len(want) {
+					t.Fatalf("%d samples from %d of %d, against %d from %d of the oracle's %d", n, at, got.frames(), n, from, len(want))
+				}
+				worst := 0.0
+				for i := 0; i < n; i++ {
+					worst = math.Max(worst, math.Abs(got.s[at+i]-float64(want[from+i])))
+				}
+				return worst
+			}
+			// Half a step of 16 bits, and the 32767 to 32768 that a WAVE
+			// file's full scale is short of the decoder's.
+			const tol = 4e-5
+
+			tl := govideo.NewTimeline(govideo.Canvas{})
+			tl.AddClip(path, govideo.ClipOptions{})
+			clip := exportAudio(t, tl, filepath.Join(dir, c.name+".clip.wav"), mono)
+			if clip.frames() != len(want) {
+				t.Fatalf("the clip is %d samples long, the oracle's decode %d", clip.frames(), len(want))
+			}
+			if d := differs(clip, 0, 0, len(want)); d > tol {
+				t.Errorf("the clip differs from the oracle's decode by up to %.2e", d)
+			}
+
+			tl = govideo.NewTimeline(govideo.Canvas{})
+			tl.AddClip(path, govideo.ClipOptions{Trim: govideo.Range(1500*time.Millisecond, 3*time.Second)})
+			cut := exportAudio(t, tl, filepath.Join(dir, c.name+".cut.wav"), mono)
+			if cut.frames() != 72000 {
+				t.Errorf("the trimmed clip is %d samples long, want 72000", cut.frames())
+			} else if d := differs(cut, 0, 72000, 72000); d > tol {
+				t.Errorf("the trimmed clip differs from the oracle's decode by up to %.2e", d)
+			}
+
+			tl = govideo.NewTimeline(govideo.Canvas{})
+			tl.AddGenerated(5*time.Second, govideo.GenerateOptions{})
+			tl.AddAudio(path, govideo.AudioOptions{Start: 250 * time.Millisecond})
+			added := exportAudio(t, tl, filepath.Join(dir, c.name+".added.wav"), mono)
+			if d := differs(added, 12000, 0, len(want)); d > tol {
+				t.Errorf("the added audio differs from the oracle's decode by up to %.2e", d)
+			}
+			if l := added.level(0, 0, 12000) + added.level(0, 12000+len(want), added.frames()); l != 0 {
+				t.Errorf("sound before or after the added audio (level %.5f)", l)
+			}
+		})
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 
 	"github.com/gomcpgo/govideo/internal/codechdr"
 	"github.com/gomcpgo/govideo/internal/container/avi"
+	"github.com/gomcpgo/govideo/internal/container/flac"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/mp3"
 	"github.com/gomcpgo/govideo/internal/container/wav"
@@ -225,6 +226,30 @@ func fromMP3(f *mp3.File) *Info {
 		s.BitRate = int64(float64(f.DataSize) * 8 * float64(rate) / float64(total)) // the mean
 	}
 	return &Info{Format: "mp3", Duration: s.Duration, Tags: map[string]string{}, Streams: []Stream{s}}
+}
+
+// fromFLAC describes a bare FLAC file. The length is the one its header
+// states, or where it states none, the one its last frame gives.
+func fromFLAC(f *flac.File) *Info {
+	rate := int64(f.SampleRate)
+	s := Stream{
+		Kind: Audio, Codec: "flac", TimeBase: Rational{1, rate}, Default: true, Duration: ticks(f.Samples, rate),
+		Audio: &AudioInfo{SampleRate: f.SampleRate, Channels: f.Channels, BitDepth: f.BitDepth},
+	}
+	if a, err := codechdr.ParseFLACStreamInfo(f.StreamInfo); err == nil {
+		applyAudio(&s, a)
+	}
+	if f.BlockSize > 0 {
+		s.Frames = (f.Samples + int64(f.BlockSize) - 1) / int64(f.BlockSize)
+	}
+	if d := s.Duration.Seconds(); d > 0 {
+		s.BitRate = int64(float64(f.DataSize) * 8 / d)
+	}
+	info := &Info{Format: "flac", Duration: s.Duration, Tags: map[string]string{}, Streams: []Stream{s}}
+	for k, v := range f.Tags {
+		info.Tags[k] = v
+	}
+	return info
 }
 
 // aviVideoCodecs maps upper-cased video fourccs (biCompression, else the

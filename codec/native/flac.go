@@ -9,6 +9,7 @@ import (
 	mathbits "math/bits"
 
 	"github.com/gomcpgo/govideo/internal/bits"
+	"github.com/gomcpgo/govideo/internal/codechdr"
 )
 
 // FLAC is written from RFC 9639 alone; section numbers below are its.
@@ -45,9 +46,9 @@ const (
 // The channel assignments of a stereo frame (§9.1.3).
 const (
 	flacLeftRight = 1 // two independent channels
-	flacLeftSide  = 8
-	flacSideRight = 9
-	flacMidSide   = 10
+	flacLeftSide  = codechdr.FLACLeftSide
+	flacSideRight = codechdr.FLACSideRight
+	flacMidSide   = codechdr.FLACMidSide
 )
 
 // flacSubframe is how one channel of a block is to be coded.
@@ -574,55 +575,8 @@ func (s *riceSearch) cost(res []int32, order int) (size int64, partOrder int, pa
 	return size + 6, partOrder, s.params[1<<uint(partOrder)-1 : 2<<uint(partOrder)-1]
 }
 
-var (
-	flacCRC8Table  = flacMakeCRC8()
-	flacCRC16Table = flacMakeCRC16()
-)
+// flacCRC8 is the checksum of a frame header (§9.1.8).
+func flacCRC8(b []byte) uint8 { return codechdr.FLACCRC8(b) }
 
-func flacMakeCRC8() (t [256]uint8) {
-	for i := range t {
-		c := uint8(i)
-		for range 8 {
-			if c&0x80 != 0 {
-				c = c<<1 ^ 0x07
-			} else {
-				c <<= 1
-			}
-		}
-		t[i] = c
-	}
-	return t
-}
-
-func flacMakeCRC16() (t [256]uint16) {
-	for i := range t {
-		c := uint16(i) << 8
-		for range 8 {
-			if c&0x8000 != 0 {
-				c = c<<1 ^ 0x8005
-			} else {
-				c <<= 1
-			}
-		}
-		t[i] = c
-	}
-	return t
-}
-
-// flacCRC8 is the checksum of a frame header: polynomial x^8 + x^2 + x + 1,
-// starting from 0 (§9.1.8).
-func flacCRC8(b []byte) (c uint8) {
-	for _, v := range b {
-		c = flacCRC8Table[c^v]
-	}
-	return c
-}
-
-// flacCRC16 is the checksum of a frame: polynomial x^16 + x^15 + x^2 + 1,
-// starting from 0 (§9.3).
-func flacCRC16(b []byte) (c uint16) {
-	for _, v := range b {
-		c = c<<8 ^ flacCRC16Table[uint8(c>>8)^v]
-	}
-	return c
-}
+// flacCRC16 is the checksum of a frame (§9.3).
+func flacCRC16(b []byte) uint16 { return codechdr.FLACCRC16(0, b) }

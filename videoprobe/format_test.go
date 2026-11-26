@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -43,10 +44,8 @@ func TestUnsupportedFormats(t *testing.T) {
 		format string
 		data   []byte
 	}{
-		{"flac", pad("fLaC\x00\x00\x00\x22")},
 		{"ogg", pad("OggS\x00\x02")},
 		{"adts", append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), pad("\xff\xf1\x50\x80")...)}, // behind an ID3 tag
-		{"flac", append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), pad("fLaC\x00\x00\x00\x22")...)},
 		{"adts", pad("\xff\xf1\x50\x80")},
 		{"ac3", pad("\x0b\x77\x12\x34")},
 		{"mxf", pad("\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02")},
@@ -66,6 +65,17 @@ func TestUnsupportedFormats(t *testing.T) {
 		if !errors.Is(err, ErrUnknownFormat) || err.Error() == "videoprobe:  files are not supported" {
 			t.Errorf("%s: error %q does not match ErrUnknownFormat or has no name", c.format, err)
 		}
+	}
+	// A FLAC marker with a stream description that is not valid behind it,
+	// at the start or after an ID3 tag, is a FLAC file that cannot be read;
+	// with nothing behind it, it is no known format.
+	for _, in := range [][]byte{pad("fLaC\x00\x00\x00\x22"), append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), pad("fLaC\x00\x00\x00\x22")...)} {
+		if _, err := Probe(context.Background(), bytes.NewReader(in), int64(len(in))); err == nil || !strings.HasPrefix(err.Error(), "flac: ") {
+			t.Errorf("%q: %v, want an error from the FLAC reader", in[:6], err)
+		}
+	}
+	if _, err := Probe(context.Background(), strings.NewReader("fLaC\x00\x00"), 6); err != ErrUnknownFormat {
+		t.Errorf("a FLAC marker alone: %v, want ErrUnknownFormat", err)
 	}
 	// What starts like an MP3 and holds no frames is no known format.
 	for _, in := range [][]byte{pad("ID3\x04\x00\x00"), pad("\xff\xfb\x90\x00")} {
