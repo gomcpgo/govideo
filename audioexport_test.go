@@ -697,6 +697,15 @@ func TestMP3Sources(t *testing.T) {
 				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
 			}
 			want := oracle.Audio(t, path, "0:a:0")
+			// A Matroska file states the encoder's delay (CodecDelay), and
+			// the delay is cut here as any stream's priming is. ffmpeg 9
+			// cuts it too; ffmpeg 6.1, which Ubuntu 24.04 installs, leaves
+			// it in for an MP3 track, so that its decode of the four seconds
+			// is that much longer at the start.
+			if extra := len(want) - 4*48000; filepath.Ext(c.name) == ".mkv" && extra > 0 {
+				t.Logf("this ffmpeg does not cut the %d samples of delay that the file states: its decode is compared from there on", extra)
+				want = want[extra:]
+			}
 			mono := govideo.AudioExportOptions{SampleRate: 48000, Channels: 1}
 			// differs is the largest difference between got, from sample at
 			// on, and the oracle's samples from sample from on.
