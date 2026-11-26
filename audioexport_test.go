@@ -663,3 +663,86 @@ func TestExportAudioErrors(t *testing.T) {
 		t.Errorf("%d frames, want 4800", a.frames())
 	}
 }
+
+// TestMP3Sources takes the sound of MP3 files, bare and inside MP4, Matroska
+// and QuickTime files, as a clip, as a trimmed clip and as added audio, and
+// holds it against ffmpeg's decode of each file: the same samples, starting
+// where ffmpeg starts them (after the encoder's delay and the decoder's,
+// where the file states the first) and as many. The source is mono at
+// 48 kHz, so nothing is resampled or mixed on the way to the WAVE file, and
+// its beeps leave no room for a slip of a sample.
+func TestMP3Sources(t *testing.T) {
+	oracle.Require(t)
+	dir := t.TempDir()
+	src := []string{"-f", "lavfi", "-i", `aevalsrc=0.4*sin(2*PI*(300+200*t)*t)*lt(mod(t\,0.5)\,0.35):d=4:s=48000`}
+	lame := []string{"-c:a", "libmp3lame", "-b:a", "96k"}
+	for _, c := range []struct {
+		name string
+		args []string
+	}{
+		{"lame.mp3", append(src, lame...)},
+		{"vbr.mp3", append(src, "-c:a", "libmp3lame", "-q:a", "5")},
+		{"noheader.mp3", append(append(src, lame...), "-write_xing", "0", "-id3v2_version", "0")},
+		// A stream that ffmpeg copied from a file with no header: the one
+		// it writes states no delay.
+		{"copied.mp3", []string{"-i", filepath.Join(dir, "noheader.mp3"), "-c", "copy"}},
+		{"mp3.mp4", append(src, lame...)},
+		{"mp3.mkv", append(src, lame...)},
+		{"mp3.mov", append(src, lame...)},
+		{"mp3.avi", append(src, lame...)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(dir, c.name)
+			if err := oracle.TryFFmpeg(append(append([]string(nil), c.args...), path)...); err != nil {
+				oracle.Missing(t, "the oracle cannot make this fixture: %v", err)
+			}
+			want := oracle.Audio(t, path, "0:a:0")
+			mono := govideo.AudioExportOptions{SampleRate: 48000, Channels: 1}
+			// differs is the largest difference between got, from sample at
+			// on, and the oracle's samples from sample from on.
+			differs := func(got pcmFile, at, from, n int) float64 {
+				if at+n > got.frames() || from+n > len(want) {
+					t.Fatalf("%d samples from %d of %d, against %d from %d of the oracle's %d", n, at, got.frames(), n, from, len(want))
+				}
+				worst := 0.0
+				for i := 0; i < n; i++ {
+					worst = math.Max(worst, math.Abs(got.s[at+i]-float64(want[from+i])))
+				}
+				return worst
+			}
+
+			tl := govideo.NewTimeline(govideo.Canvas{})
+			tl.AddClip(path, govideo.ClipOptions{})
+			clip := exportAudio(t, tl, filepath.Join(dir, c.name+".clip.wav"), mono)
+			// A file inside a container is as long as the container says,
+			// which is not always what its frames decode to.
+			if d := clip.frames() - len(want); d < -1152 || d > 1152 || (d != 0 && filepath.Ext(c.name) == ".mp3") {
+				t.Errorf("the clip is %d samples long, the oracle's decode %d", clip.frames(), len(want))
+			}
+			n := min(clip.frames(), len(want))
+			if d := differs(clip, 0, 0, n); d > 1e-4 {
+				t.Errorf("the clip differs from the oracle's decode by up to %.2e", d)
+			}
+
+			tl = govideo.NewTimeline(govideo.Canvas{})
+			tl.AddClip(path, govideo.ClipOptions{Trim: govideo.Range(1500*time.Millisecond, 3*time.Second)})
+			cut := exportAudio(t, tl, filepath.Join(dir, c.name+".cut.wav"), mono)
+			if cut.frames() != 72000 {
+				t.Errorf("the trimmed clip is %d samples long, want 72000", cut.frames())
+			} else if d := differs(cut, 0, 72000, 72000); d > 1e-4 {
+				t.Errorf("the trimmed clip differs from the oracle's decode by up to %.2e", d)
+			}
+
+			tl = govideo.NewTimeline(govideo.Canvas{})
+			tl.AddGenerated(5*time.Second, govideo.GenerateOptions{})
+			tl.AddAudio(path, govideo.AudioOptions{Start: 250 * time.Millisecond})
+			added := exportAudio(t, tl, filepath.Join(dir, c.name+".added.wav"), mono)
+			if d := differs(added, 12000, 0, n); d > 1e-4 {
+				t.Errorf("the added audio differs from the oracle's decode by up to %.2e", d)
+			}
+			if l := added.level(0, 0, 12000) + added.level(0, 12000+n+1152, added.frames()); l > 1e-4 {
+				t.Errorf("sound before or after the added audio (level %.5f)", l)
+			}
+		})
+	}
+}

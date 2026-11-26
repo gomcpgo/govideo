@@ -210,6 +210,8 @@ func init() {
 	register(CodecInfo{ID: "mjpeg", Kind: Video, Backend: Native, PatentClass: Expired,
 		CanDecode: true, CanEncode: true, Profiles: []string{"baseline"}, MaxBitDepth: 8,
 		Chroma: []Chroma{Chroma420, Chroma422, Chroma444}})
+	register(CodecInfo{ID: "mp3", Kind: Audio, Backend: Native, PatentClass: Expired,
+		CanDecode: true, MaxBitDepth: 16})
 	// FLAC is written (audio-only export) but not yet read.
 	register(CodecInfo{ID: "flac", Kind: Audio, Backend: Native, PatentClass: RoyaltyFree,
 		CanEncode: true, MaxBitDepth: 16})
