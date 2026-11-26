@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -359,6 +360,14 @@ func TestRegistry(t *testing.T) {
 		t.Error("hevc output is not offered")
 	}
 	var cu *govideo.ErrCodecUnavailable
+	// FLAC is written by the module itself, on every platform, and not
+	// read yet.
+	if ci, err := govideo.Available("flac", govideo.Encode); err != nil || ci.Backend != govideo.Native || ci.PatentClass != govideo.RoyaltyFree {
+		t.Errorf("flac encode: %+v, %v, want the native royalty-free encoder", ci, err)
+	}
+	if _, err := govideo.Available("flac", govideo.Decode); !errors.As(err, &cu) || !strings.Contains(cu.Reason, "only encoding") || cu.Hint == "" {
+		t.Errorf("flac decode: %v, want ErrCodecUnavailable saying that only encoding is there, with a hint", err)
+	}
 	if _, err := govideo.Available("vp9", govideo.Decode); !errors.As(err, &cu) || cu.Reason == "" {
 		t.Errorf("vp9 decode: %v, want ErrCodecUnavailable with a reason", err)
 	}

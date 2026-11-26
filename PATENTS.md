@@ -8,4 +8,4 @@ You are responsible for any patent licences your product requires. This notice i
 
 ## What is in this version
 
-Of the codecs listed above, this version implements Motion JPEG (through the Go standard library) and LPCM. The `videoprobe` package additionally parses the *configuration headers* of H.264, HEVC, AV1, VP8, VP9, AAC, Opus, FLAC and MP3 to report stream metadata. That is metadata parsing only: no audio or video of those formats is decoded or encoded.
+Of the codecs listed above, this version implements Motion JPEG (through the Go standard library), LPCM and a FLAC encoder. The `videoprobe` package additionally parses the *configuration headers* of H.264, HEVC, AV1, VP8, VP9, AAC, Opus, FLAC and MP3 to report stream metadata. That is metadata parsing only: FLAC apart, which is encoded, no audio or video of those formats is decoded or encoded.

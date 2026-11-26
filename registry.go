@@ -155,6 +155,9 @@ func Available(id CodecID, op Op) (CodecInfo, error) {
 	switch {
 	case ok:
 		e.Reason = "this codec supports only " + map[bool]string{true: "decoding", false: "encoding"}[ci.CanDecode]
+		if op == Decode && known && p.backend == Native {
+			e.Hint = "a decoder is planned for phase " + string(rune('0'+p.phase))
+		}
 	case !known:
 		e.Reason = "unsupported codec"
 	case p.backend == OS && runtime.GOOS != "darwin" && runtime.GOOS != "windows":
@@ -207,6 +210,9 @@ func init() {
 	register(CodecInfo{ID: "mjpeg", Kind: Video, Backend: Native, PatentClass: Expired,
 		CanDecode: true, CanEncode: true, Profiles: []string{"baseline"}, MaxBitDepth: 8,
 		Chroma: []Chroma{Chroma420, Chroma422, Chroma444}})
+	// FLAC is written (audio-only export) but not yet read.
+	register(CodecInfo{ID: "flac", Kind: Audio, Backend: Native, PatentClass: RoyaltyFree,
+		CanEncode: true, MaxBitDepth: 16})
 	// Patent-pooled codecs exist only where the operating system has them
 	// (SPEC §4.1, §6). 10-bit HEVC is decoded to 8 bits by the system.
 	if oscodec.Load() == nil {

@@ -1,5 +1,6 @@
-// Package bits provides a bounds-checked MSB-first bit reader used by the
-// codec configuration header parsers.
+// Package bits provides a bounds-checked MSB-first bit reader, used by the
+// codec configuration header parsers, and a bit writer, used by the FLAC
+// encoder.
 package bits
 
 import "errors"

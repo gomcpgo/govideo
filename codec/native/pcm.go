@@ -97,16 +97,23 @@ func (d *PCMDecoder) Decode(p []byte) (*codec.AudioFrame, error) {
 // rounding to nearest and clamping to the valid range.
 func AppendS16LE(dst []byte, samples []float32) []byte {
 	for _, s := range samples {
-		v := float64(s) * 32767
-		switch {
-		case v != v:
-			v = 0
-		case v > 32767:
-			v = 32767
-		case v < -32768:
-			v = -32768
-		}
-		dst = binary.LittleEndian.AppendUint16(dst, uint16(int16(math.RoundToEven(v))))
+		dst = binary.LittleEndian.AppendUint16(dst, uint16(s16(s)))
 	}
 	return dst
+}
+
+// s16 is a sample as a signed 16-bit integer: scaled so that full scale is
+// 32767, rounded to nearest and clamped. Every 16-bit output goes through
+// it, so a FLAC file holds the samples a WAVE file of the same sound does.
+func s16(s float32) int16 {
+	v := float64(s) * 32767
+	switch {
+	case v != v:
+		v = 0
+	case v > 32767:
+		v = 32767
+	case v < -32768:
+		v = -32768
+	}
+	return int16(math.RoundToEven(v))
 }

@@ -33,6 +33,7 @@ type AudioExportOptions struct {
 	// list of rates for each sample rate and channel count, and the one
 	// nearest to Bitrate is used. 0 leaves the choice to the encoder: on
 	// macOS 24 kbit/s for 16 kHz mono and 128 kbit/s for 48 kHz stereo.
+	// WAVE and FLAC keep every sample and have no bit rate to choose.
 	Bitrate int
 	// Progress, if set, is called through the export, about ten times for
 	// each second of sound. Frame and TotalFrames count sample frames of
@@ -41,9 +42,11 @@ type AudioExportOptions struct {
 }
 
 // ExportAudio renders the sound of the timeline, and nothing else, to an
-// audio file at path. The format follows the file extension: .wav is 16-bit
-// PCM and is written on every platform; .m4a is AAC-LC from the operating
-// system's encoder, and where there is none the error is an
+// audio file at path. The format follows the file extension. .wav is 16-bit
+// PCM, and .flac the same samples compressed without loss, to about half
+// the size (less for clean sound, more for noisy); both are written on
+// every platform. .m4a is AAC-LC from the operating system's encoder, much
+// smaller and not exact, and where there is no such encoder the error is an
 // *ErrCodecUnavailable. Memory use does not grow with the length.
 //
 // The sound is the programme audio that Export gives a video: the clips'
@@ -75,12 +78,16 @@ func (t *Timeline) ExportAudio(ctx context.Context, path string, o AudioExportOp
 	ext := strings.ToLower(filepath.Ext(path))
 	switch ext {
 	case ".wav":
+	case ".flac":
+		if _, err := Available("flac", Encode); err != nil {
+			return err
+		}
 	case ".m4a":
 		if _, err := Available("aac", Encode); err != nil {
 			return err
 		}
 	default:
-		return fmt.Errorf("govideo: unsupported audio output extension %q (use .wav or .m4a)", filepath.Ext(path))
+		return fmt.Errorf("govideo: unsupported audio output extension %q (use .wav, .flac or .m4a)", filepath.Ext(path))
 	}
 	if len(t.items) == 0 {
 		return errors.New("govideo: the timeline has no clips, images or generated segments")
@@ -117,7 +124,7 @@ func (t *Timeline) ExportAudio(ctx context.Context, path string, o AudioExportOp
 		// Known before anything is rendered, so hours of work are not
 		// thrown away at the end.
 		if total > wav.MaxDataSize/int64(2*channels) {
-			return fmt.Errorf("govideo: %v of sound at %d Hz in %d channels does not fit in a WAV file (4 GB): lower the sample rate, or write .m4a",
+			return fmt.Errorf("govideo: %v of sound at %d Hz in %d channels does not fit in a WAV file (4 GB): lower the sample rate, or write .flac or .m4a",
 				length(b.total).Round(time.Second), rate, channels)
 		}
 		out, err := createOutput(path)
@@ -127,6 +134,16 @@ func (t *Timeline) ExportAudio(ctx context.Context, path string, o AudioExportOp
 		defer out.discard()
 		if sink, err = newWAVSink(out.File, rate, channels); err != nil {
 			return err
+		}
+		commit = out.commit
+	case ".flac":
+		out, err := createOutput(path)
+		if err != nil {
+			return err
+		}
+		defer out.discard()
+		if sink, err = newFLACSink(out.File, rate, channels); err != nil {
+			return fmt.Errorf("govideo: %w", err)
 		}
 		commit = out.commit
 	case ".m4a":
