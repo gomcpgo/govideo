@@ -19,6 +19,12 @@ github.com/ebitengine/purego (calls into the macOS codec frameworks)
   Copyright 2022 The Ebitengine Authors. Apache License 2.0.
   https://github.com/ebitengine/purego
 
-No codec source code from other projects has been adapted into this module.
-When code is adapted from a permissively licensed reference implementation,
-its original notice must be added here.
+minimp3 (the MPEG audio layer III decoder in codec/native is adapted from
+it: its tables and the arithmetic of its decoding stages)
+  By Lion (lieff) and contributors, who have dedicated it to the public
+  domain: Creative Commons CC0 1.0 Universal.
+  https://github.com/lieff/minimp3
+
+No other codec source code from other projects has been adapted into this
+module. When code is adapted from a permissively licensed reference
+implementation, its original notice must be added here.

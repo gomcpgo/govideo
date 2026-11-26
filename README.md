@@ -8,7 +8,7 @@ go get github.com/gomcpgo/govideo
 
 Requires Go 1.27 or later. No cgo.
 
-> **Status: phase 1 in progress.** On **macOS**, H.264, HEVC and AAC are decoded through the system codecs (VideoToolbox, AudioToolbox), and the widely playable **H.264 + AAC** export works. On Windows the system codec backend is not written yet, and Linux has no system codecs, so there only Motion JPEG and LPCM work for now, with FLAC as an audio output. The native VP8/VP9/AV1/Opus codecs are not written yet. See [Roadmap](#roadmap).
+> **Status: phase 1 in progress.** On **macOS**, H.264, HEVC and AAC are decoded through the system codecs (VideoToolbox, AudioToolbox), and the widely playable **H.264 + AAC** export works. On Windows the system codec backend is not written yet, and Linux has no system codecs, so there only Motion JPEG, LPCM and MP3 input work for now, with FLAC as an audio output. The native VP8/VP9/AV1/Opus codecs are not written yet. See [Roadmap](#roadmap).
 
 ## Inspecting media: `videoprobe`
 
@@ -32,7 +32,7 @@ js, _ := info.JSON() // field names close to `ffprobe -show_format -show_streams
 | Audio headers | AAC (LC, HE-AAC, HE-AACv2), Opus, FLAC, MP3, ALAC, LPCM |
 | Reported | duration, start time, frame rate, variable-frame-rate flag, coded and display size, aspect ratio, rotation, bit depth, chroma format, colour tags, HLG/PQ, Dolby Vision configuration, sample rate, channels, language, faststart, fragmentation, tags |
 
-An MP3 file's length comes from the Xing, Info or VBRI header that most encoders write, less the encoder's delay and padding where the file states them. A file with no such header is measured by reading every frame header, which gives the exact length of a variable-rate file at the cost of reading it through. (ffprobe estimates such a file from its bit rate, so the two can disagree; `videoprobe`'s figure is the one the file decodes to.)
+An MP3 file's length comes from the Xing, Info or VBRI header that most encoders write, and is the length of the sound: where the header states the encoder's delay and padding, they are left out, and the decoder's own delay with them, as ffmpeg leaves them out when it decodes the file. A file with no such header is measured by reading every frame header, which gives the exact length of a variable-rate file at the cost of reading it through. (ffprobe estimates such a file from its bit rate, so the two can disagree; `videoprobe`'s figure is the one the file decodes to.)
 
 ## One picture from a video: `govideo.Frame`
 
@@ -86,13 +86,14 @@ err := tl.ExportAudio(ctx, "meeting.m4a", govideo.AudioExportOptions{SampleRate:
 
 What works today:
 
-- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Interlaced H.264 is deinterlaced: each frame is shown as its two fields, in the order the stream gives, so a 50 or 60 fps canvas keeps all of the motion and a slower one shows no combing. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
+- **Clips** in MP4, MOV, 3GP, Matroska or AVI, with trimming. Video: H.264 (including interlaced, 10-bit and 4:2:2 streams) and HEVC (8-bit and 10-bit), both macOS only, and Motion JPEG. Interlaced H.264 is deinterlaced: each frame is shown as its two fields, in the order the stream gives, so a 50 or 60 fps canvas keeps all of the motion and a slower one shows no combing. Audio: AAC (LC, HE-AAC, HE-AACv2, xHE-AAC; macOS only), MP3, LPCM; multichannel audio is mixed down to stereo at the usual level (ITU-R BS.775). Rotation and mirroring metadata are applied; B-frame reordering, edit lists and encoder priming are handled, so picture and sound stay aligned across joins. Fragmented MP4 and variable frame rate sources work. A file that was cut short plays as far as it goes.
 - **Still images** (PNG, JPEG, GIF, WebP) shown for a set duration. The EXIF orientation of a JPEG, PNG or WebP picture is applied, so a photo comes out the right way up. Transparent parts show the canvas background colour.
 - **Mixed shapes and frame rates.** Every source is scaled onto the canvas (`Contain`, `Cover` or `Stretch`) and resampled to the canvas frame rate by timestamp.
 - **Pan and zoom over a still** ("Ken Burns"): `ImageOptions.From` and `To` give where the picture sits at the start and at the end (a magnification and an offset from the centre), and it moves between them at a steady rate, positioned to a fraction of a pixel so that slow motion is smooth.
 - **Fades and crossfades.** `FadeIn` and `FadeOut` on any clip, image or generated segment fade its picture from and to the canvas background and its sound from and to silence. `Transition` on a segment dissolves the one before into it, picture and sound, over the given time; the two overlap for that long, so the timeline gets shorter by it. Times given to `AddAudio` and caption files refer to the timeline as it then is.
 - **Generated segments** (`AddGenerated`): a solid colour, colour bars, a gradient, a checkerboard, or an animated test card that carries a timecode and a machine-readable frame number; optional centred text for title cards (Latin script); optional sine tone or once-a-second beep.
-- **Audio** from WAV files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
+- **Audio** from WAV and MP3 files or the audio track of any supported clip: mixed into the programme with gain and fades, carried as a separate track, or replacing the programme audio. Everything is resampled to 48 kHz stereo.
+- **MP3** is decoded by a decoder written in Go, on every platform: MPEG-1, MPEG-2 and MPEG-2.5 layer III, in `.mp3` files and in MP4, MOV, Matroska and AVI. A file whose header states the encoder's delay starts where its sound does, without the silence an MP3 file otherwise begins with, and a trim far into a long file does not decode what comes before it. Layers I and II (`.mp2`) and free-format streams are not decoded.
 - **Captions** from SRT or WebVTT as a soft subtitle track (`tx3g`), with an optional `.vtt` sidecar for web players.
 - **Export**, with the index at the front of the file (faststart), in `.mp4` or `.mov`:
   - `ProfileCompatible`: H.264 High + AAC-LC, tagged BT.709. macOS only for now. Video is encoded to a picture quality chosen by `Quality`, so the size follows the content: a slide show comes out small, a busy scene keeps its detail and takes what it needs. Where the system encoder has no quality mode (Intel Macs without a hardware encoder, for one) an average bit rate chosen from the picture size is used. Set `VideoBitrate` when you need a predictable size instead (the two cannot be combined: the system encoder has no quality mode with a ceiling). `AudioBitrate` sets the audio rate.
@@ -106,7 +107,7 @@ What works today:
 
 Known limits: HDR sources (HLG, PQ, Dolby Vision) are decoded but not tone-mapped yet, so they look flatter than they should; deinterlacing rebuilds each field on its own, so a stream marked interlaced whose pictures are not loses vertical detail (set `ClipOptions.Deinterlace` to `DeinterlaceOff` for such a clip, or to a field order for an interlaced stream that is not marked); H.264 output has no B-frames (on the system encoder they did not make files smaller); captions cannot be burned in yet.
 
-Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A bare MP3 file is one of these for now: `videoprobe` reads it, but there is no MP3 decoder yet. So is a FLAC file: govideo writes them but cannot read them yet. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
+Anything that needs a codec this host lacks fails with `*govideo.ErrCodecUnavailable`, which names the codec, the operation and the reason. That includes streams the system decoder refuses (AAC Main and LTP profiles, for example) and HEIC stills. A FLAC file is one of these for now: govideo writes them but cannot read them yet. A file in a container that is recognised but not read (MPEG-TS, MXF, Ogg and others) fails with `*videoprobe.UnsupportedFormatError`. `govideo.Codecs()` lists what is usable.
 
 ## Codec policy
 
@@ -124,7 +125,7 @@ No FFmpeg/libav code is used. FFmpeg and ffprobe binaries are run only by the te
 | Phase | Adds |
 |---|---|
 | 0 (done) | Containers, `videoprobe`, timeline, scaling, stills, LPCM audio mixing, soft captions, codec registry, test oracle |
-| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`, audio-only export (`ExportAudio`), a native FLAC encoder. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/MP3/FLAC decoders, burned-in captions |
+| 1 (in progress) | Done: macOS system codecs (H.264, HEVC decode, AAC), H.264 + AAC export, generated segments, AVI input, deinterlacing of H.264, fades, crossfades, pan and zoom on stills, single frames (`Frame`), MP3 in `videoprobe`, audio-only export (`ExportAudio`), a native FLAC encoder, a native MP3 decoder. To do: Windows system codecs, HDR to SDR tone mapping, native Opus/VP8/VP9/FLAC decoders, burned-in captions |
 | 2 | Native AV1 decoder and encoder, Opus encoder, AV1 + Opus export, Linux end to end |
 | 3 | MPEG-TS, interlaced sources in other codecs, AC-3, ProRes via macOS, and other archive formats |
 | 4 | SIMD and encoder efficiency |

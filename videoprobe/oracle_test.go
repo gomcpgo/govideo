@@ -32,6 +32,9 @@ type fixture struct {
 	// out the encoder's delay and padding that the header states, 6.1
 	// counts them in (2.088 s for two seconds at 16 kHz).
 	decoded bool
+	// from names an earlier fixture whose streams this one is a copy of,
+	// made with "-c copy" before args.
+	from string
 }
 
 func lavfi(v, a string) []string {
@@ -94,6 +97,10 @@ var fixtures = []fixture{
 	{name: "bare_vbr.mp3", args: cat(lavfi("", "sine=f=440:d=3:r=32000"), []string{"-c:a", "libmp3lame", "-q:a", "6", "-write_xing", "0", "-write_id3v1", "1"}), decoded: true},
 	{name: "mono16k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=16000"), []string{"-c:a", "libmp3lame", "-q:a", "4", "-ac", "1"}), decoded: true},
 	{name: "8k.mp3", args: cat(lavfi("", "sine=f=440:d=2:r=8000"), []string{"-c:a", "libmp3lame", "-b:a", "16k", "-ac", "1", "-metadata", "title=a title"}), decoded: true},
+	// A stream that ffmpeg copied from a file without a header gets one
+	// that states no delay, and ffmpeg takes the decoder's own off its
+	// start all the same.
+	{name: "copied.mp3", from: "bare.mp3", decoded: true},
 	{name: "layer2.mp2", args: cat(lavfi("", asrc), []string{"-c:a", "mp2", "-b:a", "128k", "-ac", "2"})},
 	{name: "prores.mov", args: cat(lavfi(vsrc, ""), []string{"-c:v", "prores_videotoolbox", "-profile:v", "hq"}), opt: true},
 }
@@ -105,7 +112,11 @@ func TestAgainstFFprobe(t *testing.T) {
 		fx := fx
 		t.Run(fx.name, func(t *testing.T) {
 			path := filepath.Join(dir, fx.name)
-			if err := oracle.TryFFmpeg(append(append([]string{}, fx.args...), path)...); err != nil {
+			args := append([]string{}, fx.args...)
+			if fx.from != "" {
+				args = append([]string{"-i", filepath.Join(dir, fx.from), "-c", "copy"}, args...)
+			}
+			if err := oracle.TryFFmpeg(append(args, path)...); err != nil {
 				// Optional fixtures need a hardware or OS encoder, which
 				// only some platforms have. An ffmpeg built without one
 				// of the others is an incomplete oracle.
@@ -118,12 +129,23 @@ func TestAgainstFFprobe(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := oracle.FFprobe(t, path, "-count_packets")
+			var (
+				got *videoprobe.Info
+				err error
+			)
 			if fx.decoded {
 				d := strconv.FormatFloat(float64(len(oracle.Audio(t, path, "0:a:0")))/48000, 'f', 6, 64)
 				t.Logf("ffprobe says %s s; ffmpeg decodes %s s", want.Format.Duration, d)
 				want.Format.Duration, want.Streams[0].Duration = d, d
+				// The length is that of the samples, not of a frame more
+				// or less: the decoder's delay alone is 11 ms at 48 kHz.
+				defer func() {
+					if s, _ := oracle.Seconds(d); got != nil && math.Abs(got.Duration.Seconds()-s) > 0.001 {
+						t.Errorf("duration %.4f s; ffmpeg decodes %.4f s", got.Duration.Seconds(), s)
+					}
+				}()
 			}
-			got, err := videoprobe.ProbeFile(context.Background(), path)
+			got, err = videoprobe.ProbeFile(context.Background(), path)
 			if err != nil {
 				t.Fatalf("ProbeFile: %v", err)
 			}

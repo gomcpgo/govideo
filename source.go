@@ -25,6 +25,7 @@ import (
 	"github.com/gomcpgo/govideo/internal/container/avi"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
+	"github.com/gomcpgo/govideo/internal/container/mp3"
 	"github.com/gomcpgo/govideo/internal/container/wav"
 	"github.com/gomcpgo/govideo/process"
 	"github.com/gomcpgo/govideo/videoprobe"
@@ -52,6 +53,7 @@ type media struct {
 	mkv  *matroska.File
 	wv   *wav.File
 	avi  *avi.File
+	mp3  *mp3.File
 }
 
 func openMedia(ctx context.Context, path string) (*media, error) {
@@ -91,10 +93,9 @@ func openMedia(ctx context.Context, path string) (*media, error) {
 	case "avi":
 		m.avi, err = avi.Open(ctx, f, st.Size())
 	case "mp3":
-		// videoprobe measures these files; nothing here reads their frames
-		// until there is a decoder for them.
+		// videoprobe measures layers I and II too, which have no decoder.
 		if _, err = Available(CodecID(m.info.Streams[0].Codec), Decode); err == nil {
-			err = fmt.Errorf("unsupported container %q", m.info.Format)
+			m.mp3, err = mp3.Open(ctx, f, st.Size())
 		}
 	default:
 		err = fmt.Errorf("unsupported container %q", m.info.Format)
@@ -171,6 +172,8 @@ func (m *media) reader(ctx context.Context, s *videoprobe.Stream) (packetReader,
 		}
 	case m.wv != nil:
 		return &wavReader{f: m.f, w: m.wv}, nil
+	case m.mp3 != nil:
+		return newMP3Reader(m.f, m.mp3), nil
 	case m.avi != nil:
 		for _, t := range m.avi.Streams {
 			if int64(t.Index) == s.ID {
@@ -445,6 +448,41 @@ func (r *wavReader) seekAudio(n int64) (passed int64) {
 	return r.pos
 }
 
+// mp3Reader reads the frames of a bare MP3 file.
+type mp3Reader struct {
+	f     *mp3.File
+	rd    *mp3.Reader
+	n     int64         // frames read or passed over
+	first time.Duration // the time of the first frame
+}
+
+func newMP3Reader(f io.ReaderAt, m *mp3.File) *mp3Reader {
+	r := &mp3Reader{f: m, rd: m.NewReader(f)}
+	// A file that states its encoder's delay starts where its audio does:
+	// what the encoder and the decoder put before it lies ahead of time
+	// zero and is cut. The end is cut by the stream's duration, which
+	// leaves the padding out. A file that states nothing is played as it
+	// decodes, delays and all, which is what ffmpeg does with it and what
+	// videoprobe gives as its length.
+	r.first = -time.Duration(float64(m.Lead()) / float64(m.SampleRate) * 1e9)
+	return r
+}
+
+func (r *mp3Reader) next() (packet, error) {
+	data, err := r.rd.Next()
+	if err != nil {
+		return packet{}, err
+	}
+	pts := r.first + time.Duration(float64(r.n*int64(r.f.FrameSamples))/float64(r.f.SampleRate)*1e9)
+	r.n++
+	return packet{pts: pts, data: data, sync: true}, nil
+}
+
+func (r *mp3Reader) seekAudio(n int64) (passed int64) {
+	r.n = r.rd.Skip(n)
+	return r.n
+}
+
 // --- audio -------------------------------------------------------------------
 
 // audioStream delivers a source audio stream as 48 kHz stereo float32.
@@ -482,8 +520,11 @@ func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	if ci.ID == "pcm" {
+	switch ci.ID {
+	case "pcm":
 		return native.NewPCMDecoder(s.Codec, s.Audio.Channels, s.Audio.SampleRate)
+	case "mp3":
+		return native.NewMP3Decoder(), nil
 	}
 	cfg := m.config(s, "esds")
 	if m.iso != nil {
@@ -502,6 +543,24 @@ func audioDecoder(m *media, s *videoprobe.Stream) (codec.AudioDecoder, error) {
 // whole stream gives (measured on the system decoder, SPEC §14.1). The
 // output of the run-in is dropped.
 const audioRunIn = 8
+
+// mp3RunIn is the run-in of MP3, in frames, for a stream's sample rate and
+// channels. A frame's audio data may start in the frames before it, up to
+// 511 bytes back (255 at the lower rates), so decoding has to start that
+// many bytes of audio data ahead: the count is for frames of the lowest bit
+// rate there is, which hold the least. Two more frames give the overlap of
+// the transform and the history of the synthesis filter. That is 10 frames
+// at 44.1 kHz in stereo, 31 at 24 kHz in mono and 87 at 22.05 kHz in stereo.
+func mp3RunIn(rate, channels int) int64 {
+	// The frame at 32 kbit/s (8 at the lower rates), less its header, a
+	// checksum and the side information.
+	reach, frame, side := 511, 144*32000/rate, [2]int{17, 32}
+	if rate < 32000 {
+		reach, frame, side = 255, 72*8000/rate, [2]int{9, 17}
+	}
+	data := max(frame-4-2-side[min(max(channels, 1), 2)-1], 1)
+	return int64((reach+data-1)/data + 2)
+}
 
 // pcmRunIn is the run-in of PCM: there is no decoder state, but the
 // resampler's filter reaches some tens of samples back (4 ms at 8 kHz).
@@ -533,8 +592,13 @@ func (a *audioStream) seek(ctx context.Context, m *media, s *videoprobe.Stream, 
 	}
 	pcm := strings.HasPrefix(s.Codec, "pcm_")
 	// No packet of compressed audio is shorter than 960 samples at the
-	// container's rate: a cut inside the run-in is not looked at further.
-	if !pcm && trim < audioRunIn*960*time.Second/time.Duration(s.Audio.SampleRate) {
+	// container's rate (576 of MP3): a cut inside the run-in is not looked
+	// at further.
+	runIn, shortest := int64(audioRunIn), int64(960)
+	if s.Codec == "mp3" {
+		runIn, shortest = mp3RunIn(s.Audio.SampleRate, s.Audio.Channels), 576
+	}
+	if !pcm && trim < time.Duration(runIn*shortest)*time.Second/time.Duration(s.Audio.SampleRate) {
 		return
 	}
 	// The stream's first packet, from a reader and a decoder of its own,
@@ -567,7 +631,6 @@ func (a *audioStream) seek(ctx context.Context, m *media, s *videoprobe.Stream, 
 		// as the first. One with packets of several lengths (Opus, Vorbis)
 		// will need its reader to count samples.
 		per = int64(len(fr.Samples) / fr.Channels)
-		runIn := int64(audioRunIn)
 		if m.mkv != nil {
 			for _, t := range m.mkv.Tracks {
 				if int64(t.Number) == s.ID {

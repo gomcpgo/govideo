@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/gomcpgo/govideo/internal/codechdr"
@@ -198,4 +199,87 @@ func FuzzOpen(f *testing.F) {
 			t.Fatalf("%+v", *m)
 		}
 	})
+}
+
+// TestLead checks where the audio of a file starts and how long it is, by
+// what its header states: ffmpeg's rule, measured on files with these
+// headers (SPEC §14.1). A header that has LAME's extension is gone by even
+// when the delay in it is 0, as in a stream that ffmpeg copied.
+func TestLead(t *testing.T) {
+	for _, c := range []struct {
+		name           string
+		lame           bool
+		delay, padding int
+		lead           int
+		samples        int64
+	}{
+		{"no extension", false, 0, 0, 0, 11520},
+		{"LAME's delay and padding", true, 576, 1080, 576 + 529, 11520 - 576 - 1080},
+		{"an extension that states nothing", true, 0, 0, 529, 11520 - 529},
+		{"padding shorter than the decoder's delay", true, 576, 100, 576 + 529, 11520 - 576 - 529},
+		{"padding alone", true, 0, 1000, 529, 11520 - 1000},
+	} {
+		f := open(t, cat(frame(t, h128, 36, xing("Info", 10, c.lame, c.delay, c.padding)...), frames(t, h128, 10)))
+		if f.Stated != c.lame || f.Lead() != c.lead || f.Samples() != c.samples {
+			t.Errorf("%s: stated %v, lead %d, %d samples; want %v, %d, %d", c.name, f.Stated, f.Lead(), f.Samples(), c.lame, c.lead, c.samples)
+		}
+	}
+}
+
+// TestReader reads the frames of a file that has everything around them: a
+// tag in front, a header frame, a break in the stream, a tag behind.
+func TestReader(t *testing.T) {
+	numbered := func(hdr []byte, from, n int) []byte {
+		var out []byte
+		for i := from; i < from+n; i++ {
+			out = append(out, frame(t, hdr, 40, byte(i), 0xab)...)
+		}
+		return out
+	}
+	junk := bytes.Repeat([]byte{0x11}, 333)
+	v1 := append([]byte("TAG"), make([]byte, 125)...)
+	for name, data := range map[string][]byte{
+		"counted": cat(id3v2(64), numbered(h128, 0, 5), junk, numbered(h64, 5, 7), v1),
+		"header":  cat(id3v2(64), frame(t, h128, 36, xing("Xing", 12, true, 576, 600)...), numbered(h128, 0, 5), junk, numbered(h64, 5, 7), v1),
+	} {
+		f := open(t, data)
+		if f.Frames != 12 {
+			t.Fatalf("%s: %d frames, want 12", name, f.Frames)
+		}
+		src := bytes.NewReader(data)
+		r := f.NewReader(src)
+		for i := 0; i < 12; i++ {
+			fr, err := r.Next()
+			if err != nil {
+				t.Fatalf("%s: frame %d: %v", name, i, err)
+			}
+			want := 417
+			if i >= 5 {
+				want = 208
+			}
+			if len(fr) != want || fr[0] != 0xff || fr[40] != byte(i) || fr[41] != 0xab {
+				t.Fatalf("%s: frame %d is %d bytes, numbered %d", name, i, len(fr), fr[40])
+			}
+		}
+		if _, err := r.Next(); err != io.EOF {
+			t.Errorf("%s: after the last frame: %v, want io.EOF", name, err)
+		}
+		// Skipping reads the same frames.
+		for _, n := range []int64{0, 1, 4, 5, 6, 11} {
+			r := f.NewReader(src)
+			if got := r.Skip(n); got != n {
+				t.Fatalf("%s: skipped %d of %d", name, got, n)
+			}
+			if fr, err := r.Next(); err != nil || fr[40] != byte(n) {
+				t.Errorf("%s: after skipping %d: frame %d, %v", name, n, fr[40], err)
+			}
+		}
+		r = f.NewReader(src)
+		if got := r.Skip(100); got != 12 {
+			t.Errorf("%s: skipped %d frames of 12", name, got)
+		}
+		if _, err := r.Next(); err != io.EOF {
+			t.Errorf("%s: after skipping everything: %v, want io.EOF", name, err)
+		}
+	}
 }

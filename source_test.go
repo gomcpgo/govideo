@@ -154,6 +154,16 @@ func TestAudioSeek(t *testing.T) {
 		{"pcm.mov", append(tone, "-c:a", "pcm_s16le"), false},
 		{"pcm48.mov", append(tone, "-c:a", "pcm_s24be", "-ar", "48000"), false},
 		{"pcm.avi", append(append(picture, tone...), "-c:v", "mjpeg", "-c:a", "pcm_s16le"), false},
+		// MP3 frames keep their audio data in the frames before them, the
+		// more the lower the bit rate: the run-in has to reach that far.
+		{"cbr.mp3", append(tone, "-c:a", "libmp3lame", "-b:a", "128k"), false},
+		{"vbr.mp3", append(tone, "-c:a", "libmp3lame", "-q:a", "6"), false},
+		{"noheader.mp3", append(tone, "-c:a", "libmp3lame", "-b:a", "48k", "-ac", "1", "-write_xing", "0"), false},
+		{"mono24.mp3", append(tone, "-c:a", "libmp3lame", "-b:a", "16k", "-ac", "1", "-ar", "24000"), false},
+		{"stereo22.mp3", append(tone, "-c:a", "libmp3lame", "-b:a", "32k", "-ar", "22050"), false},
+		{"mp3.mp4", append(tone, "-c:a", "libmp3lame", "-b:a", "64k"), false},
+		{"mp3.mkv", append(tone, "-c:a", "libmp3lame", "-b:a", "64k"), false},
+		{"mp3.mov", append(append(picture, tone...), "-c:v", "mjpeg", "-c:a", "libmp3lame", "-b:a", "96k"), false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			if c.os && !BuildInfo().OSBackend {

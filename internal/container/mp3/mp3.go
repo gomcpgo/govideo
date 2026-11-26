@@ -1,6 +1,6 @@
-// Package mp3 measures bare MPEG audio files (.mp3, and layers I and II):
-// the format of the stream and how many frames it holds. It decodes no
-// audio.
+// Package mp3 reads bare MPEG audio files (.mp3, and layers I and II): the
+// format of the stream, how many frames it holds, and the frames themselves.
+// It decodes no audio.
 //
 // The frame count comes from the Xing/Info or VBRI header that most encoders
 // put in the first frame. A file without one is measured by reading the
@@ -35,9 +35,12 @@ type File struct {
 	// file having no header that states it.
 	Counted bool
 	// Delay and Padding are the samples the encoder put before and after
-	// the audio, from the LAME extension of the Xing/Info header. Both are 0
-	// when the file does not say.
+	// the audio, from the LAME extension of the Xing/Info header, and Stated
+	// reports that the header has that extension. Both are 0 in a file
+	// without it, and may be in one with it: ffmpeg writes zeros around a
+	// stream it copies.
 	Delay, Padding int
+	Stated         bool
 	// BitRate is that of the first audio frame; VBR reports that the file
 	// says its rate varies (a Xing or VBRI header) or that frames of
 	// another rate were counted.
@@ -45,12 +48,37 @@ type File struct {
 	VBR        bool
 	DataOffset int64 // the first audio frame
 	DataSize   int64 // bytes from there to the end of the audio
+
+	layer int
 }
 
-// Samples returns the length of the audio in sample frames, without the
-// encoder's delay and padding where the file states them.
+// DecoderDelay is the delay of a layer III decoder, in samples: its output
+// starts this much before the sound the encoder was given, after whatever
+// delay the encoder has of its own.
+const DecoderDelay = 529
+
+// Lead returns how many samples a decoder gives before the audio starts: the
+// encoder's delay and the decoder's, in a file that states the first. A file
+// that states nothing is played as it decodes, delays and all, and Lead is 0.
+// That is what ffmpeg does (measured: it goes by the extension when the
+// encoder named in it is LAME, Lavc or Lavf, whatever the delay it states).
+func (f *File) Lead() int {
+	if !f.Stated || f.layer != 3 {
+		return 0
+	}
+	return f.Delay + DecoderDelay
+}
+
+// Samples returns the length of the audio in sample frames: what the frames
+// decode to, without Lead at the start and, at the end, without the padding
+// the file states, less the decoder's delay, which the padding has to cover
+// before any of it is left over.
 func (f *File) Samples() int64 {
-	return max(f.Frames*int64(f.FrameSamples)-int64(f.Delay)-int64(f.Padding), 0)
+	n := f.Frames*int64(f.FrameSamples) - int64(f.Lead())
+	if f.Lead() > 0 {
+		n -= int64(max(f.Padding-DecoderDelay, 0))
+	}
+	return max(n, 0)
 }
 
 const (
@@ -183,7 +211,7 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 		return nil, ErrNotMP3
 	}
 	f := &File{Codec: [...]string{"mp1", "mp2", "mp3"}[h.Layer-1], SampleRate: h.SampleRate,
-		Channels: 2, FrameSamples: h.Samples, BitRate: h.BitRate}
+		Channels: 2, FrameSamples: h.Samples, BitRate: h.BitRate, layer: h.Layer}
 	if h.Mono {
 		f.Channels = 1
 	}
@@ -192,7 +220,7 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 	// A header in the first frame gives the number of frames that follow.
 	if info, ok := parseInfo(w.at(pos, h.Size), h); ok {
 		pos += int64(h.Size)
-		f.VBR, f.Delay, f.Padding = info.vbr, info.delay, info.padding
+		f.VBR, f.Delay, f.Padding, f.Stated = info.vbr, info.delay, info.padding, info.stated
 		if first, ok := w.frame(pos, end, st); ok {
 			f.BitRate = first.BitRate
 		}
@@ -208,30 +236,21 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 
 	// No count: read every frame header.
 	f.Counted = true
-	breaks := 0
-	for n := 0; pos+4 <= end; n++ {
+	k := walker{w: w, pos: pos, end: end, st: st}
+	for n := 0; ; n++ {
 		if n&0x3ff == 0 {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 		}
-		fh, ok := w.frame(pos, end, st)
+		_, fh, ok := k.next()
 		if !ok {
-			// Not a frame: a tag (APE, lyrics) or damage. Go on from the
-			// next frame, if one is near.
-			if breaks++; breaks > maxBreaks {
-				break
-			}
-			if pos, _, ok = w.find(pos+1, end, st); !ok {
-				break
-			}
-			continue
+			break
 		}
 		if fh.BitRate != f.BitRate {
 			f.VBR = true
 		}
 		f.Frames++
-		pos += int64(fh.Size)
 	}
 	if f.Frames == 0 {
 		return nil, ErrNotMP3
@@ -239,11 +258,84 @@ func Open(ctx context.Context, r io.ReaderAt, size int64) (*File, error) {
 	return f, nil
 }
 
+// walker steps through the frames of a stream.
+type walker struct {
+	w        *window
+	pos, end int64
+	st       stream
+	breaks   int
+}
+
+// next returns where the next frame is and its header; ok is false at the
+// end of the audio.
+func (k *walker) next() (pos int64, h codechdr.MPEGAudioFrame, ok bool) {
+	for k.pos+4 <= k.end {
+		if h, ok = k.w.frame(k.pos, k.end, k.st); ok {
+			pos = k.pos
+			k.pos += int64(h.Size)
+			return pos, h, true
+		}
+		// Not a frame: a tag (APE, lyrics) or damage. Go on from the next
+		// frame, if one is near.
+		if k.breaks++; k.breaks > maxBreaks {
+			break
+		}
+		at, _, found := k.w.find(k.pos+1, k.end, k.st)
+		if !found {
+			break
+		}
+		k.pos = at
+	}
+	k.pos = k.end
+	return 0, h, false
+}
+
+// Reader reads the audio frames of a file in order: the frames that Open
+// counts where the file does not state their number.
+type Reader struct {
+	k walker
+}
+
+// NewReader returns a reader placed at the first audio frame of f. r is the
+// file that Open read.
+func (f *File) NewReader(r io.ReaderAt) *Reader {
+	end := f.DataOffset + f.DataSize
+	return &Reader{k: walker{w: &window{r: r, size: end}, pos: f.DataOffset, end: end,
+		st: stream{f.layer, f.SampleRate}}}
+}
+
+// Next returns the next frame, header included. The bytes are valid until
+// the next call. The error is io.EOF after the last frame.
+func (r *Reader) Next() ([]byte, error) {
+	pos, h, ok := r.k.next()
+	if !ok {
+		return nil, io.EOF
+	}
+	b := r.k.w.at(pos, h.Size)
+	if b == nil {
+		return nil, io.EOF
+	}
+	return b, nil
+}
+
+// Skip passes over up to n frames, reading their headers only, and returns
+// how many it passed.
+func (r *Reader) Skip(n int64) (passed int64) {
+	for passed < n {
+		if _, _, ok := r.k.next(); !ok {
+			break
+		}
+		passed++
+	}
+	return passed
+}
+
 // info is the content of a Xing, Info or VBRI header.
 type info struct {
 	frames         int64
 	vbr            bool
 	delay, padding int
+	stated         bool // the LAME extension is there
 }
 
 // parseInfo reads the header that an encoder may put in the first frame, a
@@ -306,6 +398,7 @@ func parseInfo(fr []byte, h codechdr.MPEGAudioFrame) (in info, ok bool) {
 			d := fr[p+21 : p+24]
 			in.delay = int(d[0])<<4 | int(d[1])>>4
 			in.padding = int(d[1]&15)<<8 | int(d[2])
+			in.stated = true
 		}
 	}
 	return in, true
