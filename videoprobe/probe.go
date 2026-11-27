@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gomcpgo/govideo/internal/container/avi"
+	"github.com/gomcpgo/govideo/internal/container/flac"
 	"github.com/gomcpgo/govideo/internal/container/isobmff"
 	"github.com/gomcpgo/govideo/internal/container/matroska"
 	"github.com/gomcpgo/govideo/internal/container/mp3"
@@ -29,13 +30,13 @@ var ErrUnknownFormat = errors.New("videoprobe: unrecognised container format")
 // not one this package reads. errors.Is(err, ErrUnknownFormat) is true for
 // it, so callers that only ask "can this be probed" need no change.
 type UnsupportedFormatError struct {
-	// Format is a short name: "flac", "ogg", "ac3", "adts", "mpegts", "mxf",
-	// "heif", "asf" or "flv".
+	// Format is a short name: "ogg", "ac3", "adts", "mpegts", "mxf", "heif",
+	// "asf" or "flv".
 	Format string
 }
 
 var unsupportedNames = map[string]string{
-	"flac": "FLAC", "ogg": "Ogg", "ac3": "raw AC-3", "adts": "raw AAC (ADTS)",
+	"ogg": "Ogg", "ac3": "raw AC-3", "adts": "raw AAC (ADTS)",
 	"mpegts": "MPEG transport stream", "mxf": "MXF", "heif": "HEIF/HEIC/AVIF image", "asf": "ASF/WMV", "flv": "FLV",
 }
 
@@ -64,8 +65,6 @@ func sniffUnsupported(head []byte, r io.ReaderAt) string {
 		case "heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1", "avif", "avis":
 			return "heif"
 		}
-	case has(0, "fLaC"):
-		return "flac"
 	case has(0, "OggS"):
 		return "ogg"
 	case has(0, "FLV\x01"):
@@ -118,7 +117,7 @@ func (k Kind) String() string {
 
 // Info describes a media file.
 type Info struct {
-	Format     string // "mp4", "mov", "matroska", "webm", "wav", "avi", "mp3"
+	Format     string // "mp4", "mov", "matroska", "webm", "wav", "avi", "mp3", "flac"
 	Duration   time.Duration
 	StartTime  time.Duration
 	BitRate    int64 // bits per second, overall
@@ -240,6 +239,15 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 			return nil, err
 		}
 		info = fromISOBMFF(f)
+	case isFLAC(head, r, size):
+		f, err := flac.Open(ctx, r, size)
+		if errors.Is(err, flac.ErrNotFLAC) {
+			return nil, ErrUnknownFormat // the marker and nothing behind it
+		}
+		if err != nil {
+			return nil, err
+		}
+		info = fromFLAC(f)
 	case mp3.Sniff(head):
 		// Last: an ID3 tag or twelve set bits say little, and Open looks
 		// for the frames themselves.
@@ -267,9 +275,27 @@ func Probe(ctx context.Context, r io.ReaderAt, size int64) (*Info, error) {
 	return info, nil
 }
 
+// isFLAC reports whether a file has the marker of a FLAC file where it
+// starts, or behind the ID3v2 tags that some programs put in front of one.
+func isFLAC(head []byte, r io.ReaderAt, size int64) bool {
+	if flac.Sniff(head) {
+		return true
+	}
+	if len(head) < 3 || string(head[:3]) != "ID3" {
+		return false
+	}
+	var marker [4]byte
+	off := mp3.SkipTags(r, size)
+	if off+4 > size {
+		return false
+	}
+	_, err := r.ReadAt(marker[:], off)
+	return err == nil && flac.Sniff(marker[:])
+}
+
 // notMP3 is the error for a file that starts like an MPEG audio file and
-// holds no frames. ID3 tags are also put in front of other audio (raw AAC,
-// FLAC), so what follows them is looked at.
+// holds no frames. ID3 tags are also put in front of other audio (raw AAC),
+// so what follows them is looked at.
 func notMP3(r io.ReaderAt, size int64) error {
 	if off := mp3.SkipTags(r, size); off > 0 && off < size {
 		rest := io.NewSectionReader(r, off, size-off)

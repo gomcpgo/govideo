@@ -101,6 +101,10 @@ var fixtures = []fixture{
 	// that states no delay, and ffmpeg takes the decoder's own off its
 	// start all the same.
 	{name: "copied.mp3", from: "bare.mp3", decoded: true},
+	{name: "mono.flac", args: cat(lavfi("", asrc), []string{"-c:a", "flac"})},
+	{name: "stereo.flac", args: cat(lavfi("", "sine=f=440:d=3:r=44100"), []string{"-c:a", "flac", "-ac", "2", "-metadata", "title=a title"})},
+	{name: "s24_51.flac", args: cat(lavfi("", "sine=f=440:d=2:r=96000"), []string{"-c:a", "flac", "-sample_fmt", "s32", "-ac", "6"})},
+	{name: "small_blocks.flac", args: cat(lavfi("", "sine=f=440:d=2:r=8000"), []string{"-c:a", "flac", "-frame_size", "256"})},
 	{name: "layer2.mp2", args: cat(lavfi("", asrc), []string{"-c:a", "mp2", "-b:a", "128k", "-ac", "2"})},
 	{name: "prores.mov", args: cat(lavfi(vsrc, ""), []string{"-c:v", "prores_videotoolbox", "-profile:v", "hq"}), opt: true},
 }
@@ -181,6 +185,14 @@ func compare(t *testing.T, fx fixture, got *videoprobe.Info, want *oracle.Result
 	if st, ok := oracle.Seconds(want.Format.StartTime); ok && math.Abs(got.StartTime.Seconds()-st) > tol && !bareMP3 {
 		t.Errorf("format start_time: got %.4f, want %.4f", got.StartTime.Seconds(), st)
 	}
+	// The tags of a FLAC file are its Vorbis comments, which ffprobe lists.
+	if got.Format == "flac" {
+		for k, v := range want.Format.Tags {
+			if got.Tags[strings.ToLower(k)] != v {
+				t.Errorf("tag %s: got %q, want %q", k, got.Tags[strings.ToLower(k)], v)
+			}
+		}
+	}
 	for i, w := range want.Streams {
 		g := got.Streams[i]
 		pre := "stream " + strconv.Itoa(i) + " (" + w.CodecName + "): "
@@ -199,7 +211,7 @@ func compare(t *testing.T, fx fixture, got *videoprobe.Info, want *oracle.Result
 		if st, ok := oracle.Seconds(w.StartTime); ok && math.Abs(g.StartTime.Seconds()-st) > tol && !bareMP3 {
 			t.Errorf(pre+"start_time: got %.4f, want %.4f", g.StartTime.Seconds(), st)
 		}
-		if n, err := strconv.ParseInt(w.NbReadPackets, 10, 64); err == nil && (w.CodecType == "video" || bareMP3) && g.Frames != n {
+		if n, err := strconv.ParseInt(w.NbReadPackets, 10, 64); err == nil && (w.CodecType == "video" || bareMP3 || got.Format == "flac") && g.Frames != n {
 			t.Errorf(pre+"frames: got %d, want %d", g.Frames, n)
 		}
 		switch w.CodecType {
@@ -278,6 +290,10 @@ func compare(t *testing.T, fx fixture, got *videoprobe.Info, want *oracle.Result
 			}
 			if strings.HasPrefix(w.CodecName, "pcm") && w.BitsPerSample > 0 && a.BitDepth != w.BitsPerSample {
 				t.Errorf(pre+"bit depth: got %d, want %d", a.BitDepth, w.BitsPerSample)
+			}
+			// A FLAC stream's sample size is ffprobe's bits_per_raw_sample.
+			if n, err := strconv.Atoi(w.BitsPerRaw); err == nil && w.CodecName == "flac" && a.BitDepth != n {
+				t.Errorf(pre+"bit depth: got %d, want %d", a.BitDepth, n)
 			}
 		}
 	}

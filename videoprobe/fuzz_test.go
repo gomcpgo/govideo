@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -124,6 +125,54 @@ func TestMP3(t *testing.T) {
 	}
 }
 
+// flacSeed is the second example file of RFC 9639 (appendix D.2): 19 sample
+// frames of 16-bit stereo at 44.1 kHz in two frames of 16 and 3, behind a
+// seek table, a comment block with a title, and padding.
+func flacSeed() []byte {
+	b, err := hex.DecodeString("664c614300000022001000100000170000440ac442f000000013d5b0564975e98b8d8b930422757b8103" +
+		"03000012000000000000000000000000000000000010" +
+		"0400003a200000007265666572656e6365206c6962464c414320312e332e33203230313930383034010000000e000000" +
+		"5449544c453dd7a9d79cd795d79d" + "81000006000000000000" +
+		"fff86998000f9912086701623d1442998f5df70d6fe00c17caeb21000ee7a77a24a1590c1217b603097b784faa9a33d285e070ad5b1b4851b4010d99d2cd1a68f1e6b810" +
+		"fff869180102a402c382c40bc14a03ee48dd03b67c1330")
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func TestFLAC(t *testing.T) {
+	seed := flacSeed()
+	// The length it states, and the length its last frame gives where the
+	// header leaves it out; with an ID3 tag in front, as some programs put
+	// one.
+	unstated := bytes.Clone(seed)
+	copy(unstated[8+13:8+18], []byte{unstated[8+13] & 0xf0, 0, 0, 0, 0})
+	tagged := append([]byte("ID3\x04\x00\x00\x00\x00\x00\x08tagbytes"), seed...)
+	for name, data := range map[string][]byte{"as it is": seed, "no length stated": unstated, "behind an ID3 tag": tagged} {
+		info, err := Probe(context.Background(), bytes.NewReader(data), int64(len(data)))
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := 430839 * time.Nanosecond // 19 samples at 44.1 kHz
+		if info.Format != "flac" || len(info.Streams) != 1 || info.Duration != want || info.StartTime != 0 || info.Tags["title"] != "שלום" {
+			t.Fatalf("%s: format %q, %d streams, duration %v (want %v), tags %q", name, info.Format, len(info.Streams), info.Duration, want, info.Tags)
+		}
+		a := info.Streams[0]
+		if a.Kind != Audio || a.Codec != "flac" || a.Frames != 2 || a.Duration != want || !a.Default ||
+			a.Audio.SampleRate != 44100 || a.Audio.Channels != 2 || a.Audio.BitDepth != 16 || a.Audio.ChannelLayout != "stereo" || a.TimeBase != (Rational{1, 44100}) {
+			t.Errorf("%s: audio: %+v %+v", name, a, a.Audio)
+		}
+		if _, err := info.JSON(); err != nil {
+			t.Errorf("%s: JSON: %v", name, err)
+		}
+	}
+	// A file that states a length and has no frames is not read as one.
+	if _, err := Probe(context.Background(), bytes.NewReader(seed[:0x88]), 0x88); err == nil {
+		t.Error("a FLAC file with no frames: probed")
+	}
+}
+
 // FuzzProbe feeds arbitrary bytes through container sniffing, parsing and
 // JSON rendering. Seeds for each container come from the corpus directory
 // and the container packages' own fuzz targets.
@@ -133,6 +182,7 @@ func FuzzProbe(f *testing.F) {
 	f.Add([]byte("RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x02\x00\x80\xbb\x00\x00\x00\xee\x02\x00\x04\x00\x10\x00data\x00\x00\x00\x00"))
 	f.Add(aviSeed())
 	f.Add(mp3Seed())
+	f.Add(flacSeed())
 	f.Fuzz(func(t *testing.T, data []byte) {
 		info, err := Probe(context.Background(), bytes.NewReader(data), int64(len(data)))
 		if err != nil {

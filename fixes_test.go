@@ -274,10 +274,11 @@ func TestUnsupportedInputErrors(t *testing.T) {
 	var cu *govideo.ErrCodecUnavailable
 	var uf *videoprobe.UnsupportedFormatError
 
-	flac := filepath.Join(dir, "a.flac")
-	oracle.FFmpeg(t, "-f", "lavfi", "-i", "sine=f=440:d=1", "-c:a", "flac", flac)
-	if err := export(func(tl *govideo.Timeline) { tl.AddClip(flac, govideo.ClipOptions{}) }); !errors.As(err, &cu) || cu.Codec != "flac" {
-		t.Errorf("FLAC file: %v, want ErrCodecUnavailable for flac", err)
+	// A bare audio file of a codec with no decoder is a missing codec.
+	ac3 := filepath.Join(dir, "a.ac3")
+	oracle.FFmpeg(t, "-f", "lavfi", "-i", "sine=f=440:d=1", "-c:a", "ac3", ac3)
+	if err := export(func(tl *govideo.Timeline) { tl.AddClip(ac3, govideo.ClipOptions{}) }); !errors.As(err, &cu) || cu.Codec != "ac3" {
+		t.Errorf("AC-3 file: %v, want ErrCodecUnavailable for ac3", err)
 	}
 	// A bare MPEG audio file of layer II is read by videoprobe, as an MP3
 	// file is, but only layer III has a decoder.
