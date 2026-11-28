@@ -60,7 +60,9 @@ func (f *VideoFrame) ChromaSize() (w, h int) { return (f.Width + 1) / 2, (f.Heig
 // A sample fills its 16 bits from the top, as P010 stores it: a 10-bit value
 // v is held as v<<6. Black and white of a limited-range picture are then
 // 4096 and 60160 whatever the depth, and a chroma sample of no colour is
-// 32768.
+// 32768. A sample is read as all 16 bits: the bits below the depth are zero
+// from a stream of that depth, and a decoder that widens a shallower stream
+// may fill them.
 type DeepFrame struct {
 	Width, Height int
 	Y, Cb, Cr     []uint16

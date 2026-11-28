@@ -573,6 +573,11 @@ func TestPictures(t *testing.T) {
 // the copy out of the 10-bit pixel buffer. (A stream that has 10 bits of its
 // own needs an encoder the system does not lend this package: the pipeline's
 // tests decode one.)
+//
+// What the system puts below the 8 bits is its own business. The hardware
+// decoder of an Apple silicon Mac leaves zeros (0x10 becomes 0x1000); where
+// the picture is widened in software, as on an Intel Mac and in the virtual
+// machines CI runs on, the sample is repeated (0x1010).
 func TestDeepPictures(t *testing.T) {
 	if err := Load(); err != nil {
 		t.Skipf("frameworks unavailable: %v", err)
@@ -622,11 +627,11 @@ func TestDeepPictures(t *testing.T) {
 			len(wide.Y) != w*h || len(wide.Cb) != len(frame.Cb) || len(wide.Cr) != len(frame.Cr) {
 			t.Fatalf("deep frame is %dx%d, depth %d, matrix %d, full range %t", wide.Width, wide.Height, wide.Depth, wide.Matrix, wide.FullRange)
 		}
-		// The system may round where it widens; a sample is within one
-		// 8-bit step, and has nothing below its 10 bits.
+		// The system may round where it widens, and fill the bits below:
+		// a sample is within one 8-bit step.
 		check := func(name string, deep []uint16, flat []byte) {
 			for j, v := range deep {
-				if d := int(v) - int(flat[j])<<8; d < -256 || d > 256 || v&63 != 0 {
+				if d := int(v) - int(flat[j])<<8; d < -256 || d > 256 {
 					t.Fatalf("picture %d, %s sample %d: %#04x in 10 bits, %#02x in 8", i, name, j, v, flat[j])
 				}
 			}
