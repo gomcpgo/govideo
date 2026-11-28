@@ -38,6 +38,15 @@ type Picture interface {
 	Release()
 }
 
+// DeepPicture is a picture of a decoder that was asked for all the bits of
+// its stream: it can be copied out as a DeepFrame.
+type DeepPicture interface {
+	Picture
+	// DeepFrame copies the picture into a deep frame, as Frame does into a
+	// frame of 8 bits.
+	DeepFrame(into *DeepFrame) (*DeepFrame, error)
+}
+
 // TimedPicture is a decoded picture with its presentation time.
 type TimedPicture struct {
 	Picture Picture

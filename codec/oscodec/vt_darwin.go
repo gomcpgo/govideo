@@ -18,6 +18,8 @@ var decodeCallback, encodeCallback uintptr
 const (
 	pixel420v = 0x34323076 // '420v': 8-bit 4:2:0 bi-planar, video range
 	pixel420f = 0x34323066 // '420f': the same, full range
+	pixelX420 = 0x78343230 // 'x420': 10-bit 4:2:0 bi-planar (P010), video range
+	pixelXF20 = 0x78663230 // 'xf20': the same, full range
 )
 
 // --- decode ------------------------------------------------------------------
@@ -29,6 +31,7 @@ type vtDecoder struct {
 	session, format, handle uintptr
 	codec                   string // "h264" or "hevc"
 	lenSize                 int    // bytes in the length prefix of each NAL unit
+	deep                    bool   // the session gives 10-bit pictures (P010)
 
 	// used says that the session has been given a sample; restarted, that
 	// it is to go on with another stream and has not been given that
@@ -46,8 +49,8 @@ type vtDecoder struct {
 }
 
 // NewVideoDecoder returns a VideoToolbox decoder for an H.264 or HEVC stream.
-// Pictures come back as 8-bit 4:2:0; 10-bit sources are reduced to 8 bits by
-// the system.
+// Pictures come back as 8-bit 4:2:0, 10-bit sources reduced to 8 bits by the
+// system, unless c.Deep asks for 10 bits (see VideoConfig).
 func NewVideoDecoder(c VideoConfig) (codec.VideoStreamDecoder, error) {
 	if err := Load(); err != nil {
 		return nil, err
@@ -57,7 +60,7 @@ func NewVideoDecoder(c VideoConfig) (codec.VideoStreamDecoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := d.open(c.Codec, format); err != nil {
+	if err := d.open(c.Codec, format, c.Deep); err != nil {
 		return nil, err
 	}
 	d.start(c)
@@ -106,9 +109,14 @@ func nalLengthSize(c VideoConfig) int {
 }
 
 // open creates the session for a stream of the given format, which it takes
-// over.
-func (d *vtDecoder) open(codecName string, format uintptr) error {
+// over. The session converts every picture to the pixel format asked for
+// here, whatever the depth of the stream: 10 bits with deep, else 8.
+func (d *vtDecoder) open(codecName string, format uintptr, deep bool) error {
 	pf := cfInt(pixel420v)
+	if deep {
+		cfRelease(pf)
+		pf = cfInt(pixelX420)
+	}
 	attrs := cfDict(k.pixelFormatKey, pf)
 	handle := newHandle(d)
 	record := [2]uintptr{decodeCallback, handle}
@@ -122,7 +130,7 @@ func (d *vtDecoder) open(codecName string, format uintptr) error {
 		return osErr("opening the "+codecName+" decoder", st)
 	}
 	stats.sessions.Add(1)
-	d.session, d.format, d.handle, d.used = session, format, handle, false
+	d.session, d.format, d.handle, d.used, d.deep = session, format, handle, false, deep
 	return nil
 }
 
@@ -152,16 +160,16 @@ func (d *vtDecoder) shut() {
 
 // Restart makes the decoder ready for another stream, as a decoder newly
 // opened for c would be, and reports whether it could. It can when the
-// session is in good order and accepts the stream's format: the same codec,
-// and parameter sets the system decoder is willing to switch to. The
-// pictures of the stream before are released.
+// session is in good order and accepts the stream's format: the same codec
+// and depth of output, and parameter sets the system decoder is willing to
+// switch to. The pictures of the stream before are released.
 //
 // A session that has decoded something is kept only if the new stream then
 // begins with a picture that clears the decoder's reference pictures (see
 // cleanStart); otherwise the first Decode opens a new one in its place.
 // Either way the caller has a working decoder.
 func (d *vtDecoder) Restart(c VideoConfig) bool {
-	if d.session == 0 || d.failed || c.Codec != d.codec {
+	if d.session == 0 || d.failed || c.Codec != d.codec || c.Deep != d.deep {
 		return false
 	}
 	format, err := videoFormat(c)
@@ -283,18 +291,32 @@ func (d *vtDecoder) releaseAll() {
 	d.out = d.out[:0]
 }
 
-// Frame copies the bi-planar pixel buffer into a planar frame.
-func (p *vtPicture) Frame(into *codec.VideoFrame) (*codec.VideoFrame, error) {
+// planes is a decoded pixel buffer, locked for reading: its two planes and
+// what it says of itself.
+type planes struct {
+	image     uintptr
+	format    uint32
+	w, h      int
+	matrix    int
+	y, c      unsafe.Pointer
+	ys, cs    int // bytes in a row of each plane
+	fullRange bool
+}
+
+// lock locks the picture's pixel buffer for reading, having checked that it
+// is of one of the two given pixel formats (limited and full range); unlock
+// lets it go.
+func (p *vtPicture) lock(limited, full uint32, sample int) (planes, error) {
 	d := p.d
 	d.mu.Lock()
 	image := p.image
 	d.mu.Unlock()
 	if image == 0 {
-		return nil, errors.New("oscodec: a decoded picture was used after its release")
+		return planes{}, errors.New("oscodec: a decoded picture was used after its release")
 	}
 	format := cvPixelBufferGetPixelFormatType(image)
-	if (format != pixel420v && format != pixel420f) || cvPixelBufferGetPlaneCount(image) != 2 {
-		return nil, fmt.Errorf("oscodec: decoder returned unexpected pixel format %#x", format)
+	if (format != limited && format != full) || cvPixelBufferGetPlaneCount(image) != 2 {
+		return planes{}, fmt.Errorf("oscodec: decoder returned unexpected pixel format %#x", format)
 	}
 	d.mu.Lock()
 	if d.matrix == 0 {
@@ -315,28 +337,91 @@ func (p *vtPicture) Frame(into *codec.VideoFrame) (*codec.VideoFrame, error) {
 	d.mu.Unlock()
 	const readOnly = 1
 	if st := cvPixelBufferLockBaseAddress(image, readOnly); st != 0 {
-		return nil, osErr("locking a decoded frame", st)
+		return planes{}, osErr("locking a decoded frame", st)
 	}
-	defer cvPixelBufferUnlockBaseAddress(image, readOnly)
-	w, h := cvPixelBufferGetWidth(image), cvPixelBufferGetHeight(image)
-	if w <= 0 || h <= 0 || w > 1<<15 || h > 1<<15 {
-		return nil, fmt.Errorf("oscodec: decoder returned a %dx%d frame", w, h)
+	b := planes{image: image, format: format, matrix: matrix, fullRange: format == full,
+		w: cvPixelBufferGetWidth(image), h: cvPixelBufferGetHeight(image)}
+	b.y, b.ys = cvPixelBufferGetBaseAddressPlane(image, 0), cvPixelBufferGetBytesPerRowPlane(image, 0)
+	b.c, b.cs = cvPixelBufferGetBaseAddressPlane(image, 1), cvPixelBufferGetBytesPerRowPlane(image, 1)
+	var err error
+	switch {
+	case b.w <= 0 || b.h <= 0 || b.w > 1<<15 || b.h > 1<<15:
+		err = fmt.Errorf("oscodec: decoder returned a %dx%d frame", b.w, b.h)
+	case b.y == nil || b.c == nil || b.ys < b.w*sample || b.cs < 2*((b.w+1)/2)*sample:
+		err = errors.New("oscodec: decoded frame has no readable planes")
 	}
+	if err != nil {
+		b.unlock()
+		return planes{}, err
+	}
+	return b, nil
+}
+
+func (b planes) unlock() {
+	const readOnly = 1
+	cvPixelBufferUnlockBaseAddress(b.image, readOnly)
+}
+
+// Frame copies the bi-planar pixel buffer into a planar frame. A picture of
+// a session that gives 10 bits is reduced to 8 by dropping the low bits:
+// the tone mapping of such a picture reads it with DeepFrame instead.
+func (p *vtPicture) Frame(into *codec.VideoFrame) (*codec.VideoFrame, error) {
+	if p.d.deep {
+		deep, err := p.DeepFrame(nil)
+		if err != nil {
+			return nil, err
+		}
+		f := into.Reuse(deep.Width, deep.Height)
+		f.Matrix, f.FullRange = deep.Matrix, deep.FullRange
+		for i, v := range deep.Y {
+			f.Y[i] = byte(v >> 8)
+		}
+		for i := range deep.Cb {
+			f.Cb[i], f.Cr[i] = byte(deep.Cb[i]>>8), byte(deep.Cr[i]>>8)
+		}
+		return f, nil
+	}
+	b, err := p.lock(pixel420v, pixel420f, 1)
+	if err != nil {
+		return nil, err
+	}
+	defer b.unlock()
+	w, h := b.w, b.h
 	cw, ch := (w+1)/2, (h+1)/2
-	yp, ys := cvPixelBufferGetBaseAddressPlane(image, 0), cvPixelBufferGetBytesPerRowPlane(image, 0)
-	cp, cs := cvPixelBufferGetBaseAddressPlane(image, 1), cvPixelBufferGetBytesPerRowPlane(image, 1)
-	if yp == nil || cp == nil || ys < w || cs < 2*cw {
-		return nil, errors.New("oscodec: decoded frame has no readable planes")
-	}
 	f := into.Reuse(w, h)
-	f.Matrix, f.FullRange = matrix, format == pixel420f
-	src := unsafe.Slice((*byte)(yp), ys*h)
+	f.Matrix, f.FullRange = b.matrix, b.fullRange
+	src := unsafe.Slice((*byte)(b.y), b.ys*h)
 	for y := range h {
-		copy(f.Y[y*w:y*w+w], src[y*ys:])
+		copy(f.Y[y*w:y*w+w], src[y*b.ys:])
 	}
-	src = unsafe.Slice((*byte)(cp), cs*ch)
+	src = unsafe.Slice((*byte)(b.c), b.cs*ch)
 	for y := range ch {
-		kernels.SplitPairs(f.Cb[y*cw:y*cw+cw], f.Cr[y*cw:y*cw+cw], src[y*cs:])
+		kernels.SplitPairs(f.Cb[y*cw:y*cw+cw], f.Cr[y*cw:y*cw+cw], src[y*b.cs:])
+	}
+	return f, nil
+}
+
+// DeepFrame copies the 10-bit bi-planar pixel buffer (P010) of a session
+// opened with VideoConfig.Deep into a planar deep frame. P010 holds each
+// sample in the top bits of 16, as a DeepFrame does.
+func (p *vtPicture) DeepFrame(into *codec.DeepFrame) (*codec.DeepFrame, error) {
+	if !p.d.deep {
+		return nil, errors.New("oscodec: the decoder was not opened for pictures of more than 8 bits")
+	}
+	b, err := p.lock(pixelX420, pixelXF20, 2)
+	if err != nil {
+		return nil, err
+	}
+	defer b.unlock()
+	w, h := b.w, b.h
+	cw, ch := (w+1)/2, (h+1)/2
+	f := into.Reuse(w, h)
+	f.Depth, f.Matrix, f.FullRange = 10, b.matrix, b.fullRange
+	for y := range h {
+		copy(f.Y[y*w:y*w+w], unsafe.Slice((*uint16)(unsafe.Add(b.y, y*b.ys)), w))
+	}
+	for y := range ch {
+		kernels.SplitPairs16(f.Cb[y*cw:y*cw+cw], f.Cr[y*cw:y*cw+cw], unsafe.Slice((*uint16)(unsafe.Add(b.c, y*b.cs)), 2*cw))
 	}
 	return f, nil
 }
@@ -363,7 +448,7 @@ func (d *vtDecoder) Decode(p []byte, pts time.Duration) ([]codec.TimedPicture, e
 			// The session still refers to pictures of the stream before.
 			format := cfRetain(d.format)
 			d.shut()
-			if err := d.open(d.codec, format); err != nil {
+			if err := d.open(d.codec, format, d.deep); err != nil {
 				return nil, err
 			}
 		}
