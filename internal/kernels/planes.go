@@ -36,3 +36,14 @@ func SplitPairs(a, b, src []byte) {
 		a[i], b[i] = src[2*i], src[2*i+1]
 	}
 }
+
+// SplitPairs16 is SplitPairs for 16-bit samples: the even samples of src go
+// to a and the odd ones to b. It takes apart the chroma of a bi-planar
+// picture of more than 8 bits (P010).
+func SplitPairs16(a, b, src []uint16) {
+	n := len(a)
+	b, src = b[:n], src[:2*n]
+	for i := range a {
+		a[i], b[i] = src[2*i], src[2*i+1]
+	}
+}

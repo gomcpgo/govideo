@@ -78,6 +78,48 @@ func thumbs(t *testing.T, filter string, args ...string) [][]byte {
 	return out
 }
 
+// hdrTone is the oracle's rendering of a high dynamic range file in the
+// standard range, for the corpus to compare with: zscale to linear light,
+// the "hable" curve of its tonemap filter, and zscale back to BT.709. It is
+// another curve than the pipeline's (the oracle has none like it), picked as
+// the nearest of those it has. Measured on the eight such files of the
+// corpus, as thumbnails: 28 to 42 dB between the two, so they are held to
+// the floor every other file is held to. That catches a wrong frame, a
+// picture the wrong way up and one that was not tone-mapped (16 to 24 dB
+// from the pipeline's on most of the files). What the tone mapping should
+// give exactly is tested in the process package.
+const hdrTone = "zscale=t=linear:npl=100,format=gbrpf32le,tonemap=hable:desat=0,zscale=p=bt709:t=bt709:m=bt709:r=tv,format=yuv420p,"
+
+// corpusFloor is the PSNR a thumbnail of an export must reach against the
+// oracle's picture of the source.
+const corpusFloor = 26.0
+
+// corpusTone returns the filters that go first in the oracle's chain for the
+// picture of a corpus file: hdrTone for a high dynamic range file, nothing
+// for any other. Where the oracle has no zscale filter it ends the test of
+// such a file with a skip, so it is called once everything else about the
+// export has been checked.
+func corpusTone(t *testing.T, in string) string {
+	t.Helper()
+	info, err := videoprobe.ProbeFile(context.Background(), in)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	for _, st := range info.Streams {
+		if st.Kind != videoprobe.Video {
+			continue
+		}
+		if st.Video.HDR == "" {
+			break
+		}
+		if !oracle.HasFilter("zscale") {
+			t.Skip("a high dynamic range file, and the oracle's ffmpeg has no zscale filter to tone-map it with: the picture is not compared (put a build that has it first on PATH; testmedia/README.md)")
+		}
+		return hdrTone
+	}
+	return ""
+}
+
 func psnr(a, b []byte) float64 {
 	var sum float64
 	for i := range a {
@@ -122,8 +164,9 @@ func corpusVideo(t *testing.T, dir string) {
 				// The picture must be what the oracle sees in the source,
 				// rotated and fitted the same way. A frame either side is
 				// allowed: the two pick frames by different rounding.
+				tone := corpusTone(t, in)
 				ours := thumbs(t, "", "-i", out)
-				ref := thumbs(t, fit, "-t", "3", "-i", in)
+				ref := thumbs(t, tone+fit, "-t", "3", "-i", in)
 				if len(ours) == 0 || len(ref) == 0 {
 					t.Fatalf("no frames to compare (%d exported, %d from the oracle)", len(ours), len(ref))
 				}
@@ -133,8 +176,10 @@ func corpusVideo(t *testing.T, dir string) {
 					for k := max(n-3, 0); k <= min(n+3, len(ref)-1); k++ {
 						best = max(best, psnr(ours[n], ref[k]))
 					}
-					if best < 26 {
-						t.Errorf("frame %d differs from the oracle's decode (PSNR %.1f dB)", n, best)
+					if best < corpusFloor {
+						t.Errorf("frame %d differs from the oracle's decode (PSNR %.1f dB, want %.0f)", n, best, corpusFloor)
+					} else if tone != "" {
+						t.Logf("frame %d: %.1f dB from the oracle's tone-mapped picture", n, best)
 					}
 				}
 			})
@@ -213,8 +258,9 @@ func corpusVideo(t *testing.T, dir string) {
 				t.Fatalf("export: %v", err)
 			}
 			defer os.Remove(out)
+			tone := corpusTone(t, in)
 			ours := thumbs(t, "", "-i", out)
-			ref := thumbs(t, fit, "-t", strconv.FormatFloat((cut+1500*time.Millisecond).Seconds(), 'f', 3, 64), "-i", in)
+			ref := thumbs(t, tone+fit, "-t", strconv.FormatFloat((cut+1500*time.Millisecond).Seconds(), 'f', 3, 64), "-i", in)
 			off := int(cut * 30 / time.Second)
 			if len(ours) == 0 || len(ref) == 0 {
 				t.Fatalf("no frames to compare (%d exported, %d from the oracle)", len(ours), len(ref))
@@ -231,8 +277,8 @@ func corpusVideo(t *testing.T, dir string) {
 				for k := max(min(off+n, len(ref)-1)-3, 0); k <= min(off+n+3, len(ref)-1); k++ {
 					best = max(best, psnr(ours[n], ref[k]))
 				}
-				if best < 26 {
-					t.Errorf("frame %d after the cut at %v differs from the oracle's decode (PSNR %.1f dB)", n, cut, best)
+				if best < corpusFloor {
+					t.Errorf("frame %d after the cut at %v differs from the oracle's decode (PSNR %.1f dB, want %.0f)", n, cut, best, corpusFloor)
 				}
 			}
 			// The sound is cut at the same place, and its decoder too starts

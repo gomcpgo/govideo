@@ -196,6 +196,22 @@ func Ratio(s string) float64 {
 	return n / d
 }
 
+// HasFilter reports whether the installed ffmpeg has the named filter. Some
+// are in fuller builds only (zscale needs zimg), and a test that compares
+// with one skips where it is missing.
+func HasFilter(name string) bool {
+	out, err := exec.Command("ffmpeg", "-hide_banner", "-filters").Output()
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if f := strings.Fields(line); len(f) > 1 && f[1] == name {
+			return true
+		}
+	}
+	return false
+}
+
 // FFmpegOutput runs ffmpeg and returns what it wrote to standard output,
 // failing the test on error. It is used to decode media to raw samples.
 func FFmpegOutput(t testing.TB, args ...string) []byte {

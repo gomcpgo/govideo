@@ -566,6 +566,109 @@ func TestPictures(t *testing.T) {
 	}
 }
 
+// TestDeepPictures decodes one stream twice, with the usual 8-bit pictures
+// and with the 10-bit ones a high dynamic range stream is given. The stream
+// is of 8 bits, so the two must be the same picture: each deep sample the
+// 8-bit one in the top of its 16 bits, as the system widens it. That covers
+// the copy out of the 10-bit pixel buffer. (A stream that has 10 bits of its
+// own needs an encoder the system does not lend this package: the pipeline's
+// tests decode one.)
+//
+// What the system puts below the 8 bits is its own business. The hardware
+// decoder of an Apple silicon Mac leaves zeros (0x10 becomes 0x1000); where
+// the picture is widened in software, as on an Intel Mac and in the virtual
+// machines CI runs on, the sample is repeated (0x1010).
+func TestDeepPictures(t *testing.T) {
+	if err := Load(); err != nil {
+		t.Skipf("frameworks unavailable: %v", err)
+	}
+	// An odd number of chroma columns per row of the buffer would show a
+	// stride taken for a width.
+	const w, h, count = 322, 242, 6
+	packets, cfg := encodeGradient(t, w, h, 0, count, 30)
+	open := func(deep bool) codec.VideoStreamDecoder {
+		dec, err := NewVideoDecoder(VideoConfig{Codec: "h264", Width: w, Height: h, Record: cfg, Matrix: 1, Deep: deep})
+		if err != nil {
+			t.Fatalf("opening a decoder (deep %t): %v", deep, err)
+		}
+		return dec
+	}
+	flat, deep := open(false), open(true)
+	defer flat.Close()
+	defer deep.Close()
+	var frame *codec.VideoFrame
+	var wide *codec.DeepFrame
+	for i, p := range packets {
+		a, err := flat.Decode(p.Data, time.Duration(i))
+		if err != nil || len(a) != 1 {
+			t.Fatalf("packet %d: %d pictures, %v", i, len(a), err)
+		}
+		b, err := deep.Decode(p.Data, time.Duration(i))
+		if err != nil || len(b) != 1 {
+			t.Fatalf("packet %d, deep: %d pictures, %v", i, len(b), err)
+		}
+		if _, ok := a[0].Picture.(codec.DeepPicture); !ok {
+			t.Fatal("a picture is not a codec.DeepPicture")
+		}
+		if _, err := a[0].Picture.(codec.DeepPicture).DeepFrame(nil); err == nil {
+			t.Error("a decoder opened for 8 bits gave a deep frame")
+		}
+		if frame, err = a[0].Picture.Frame(frame); err != nil {
+			t.Fatal(err)
+		}
+		keep := wide
+		if wide, err = b[0].Picture.(codec.DeepPicture).DeepFrame(wide); err != nil {
+			t.Fatal(err)
+		}
+		if keep != nil && keep != wide {
+			t.Error("the deep frame offered was not reused")
+		}
+		if wide.Width != w || wide.Height != h || wide.Depth != 10 || wide.Matrix != 1 || wide.FullRange ||
+			len(wide.Y) != w*h || len(wide.Cb) != len(frame.Cb) || len(wide.Cr) != len(frame.Cr) {
+			t.Fatalf("deep frame is %dx%d, depth %d, matrix %d, full range %t", wide.Width, wide.Height, wide.Depth, wide.Matrix, wide.FullRange)
+		}
+		// The system may round where it widens, and fill the bits below:
+		// a sample is within one 8-bit step.
+		check := func(name string, deep []uint16, flat []byte) {
+			for j, v := range deep {
+				if d := int(v) - int(flat[j])<<8; d < -256 || d > 256 {
+					t.Fatalf("picture %d, %s sample %d: %#04x in 10 bits, %#02x in 8", i, name, j, v, flat[j])
+				}
+			}
+		}
+		check("Y", wide.Y, frame.Y)
+		check("Cb", wide.Cb, frame.Cb)
+		check("Cr", wide.Cr, frame.Cr)
+		// Frame of a deep picture is its samples without the low bits.
+		low, err := b[0].Picture.Frame(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for j, v := range low.Y {
+			if v != byte(wide.Y[j]>>8) {
+				t.Fatalf("picture %d: Frame of a deep picture has %#02x for %#04x", i, v, wide.Y[j])
+			}
+		}
+		a[0].Picture.Release()
+		b[0].Picture.Release()
+	}
+	// A session gives one depth: it does not go on to a stream that wants
+	// the other.
+	for _, d := range []struct {
+		dec  codec.VideoStreamDecoder
+		deep bool
+	}{{flat, true}, {deep, false}} {
+		c := VideoConfig{Codec: "h264", Width: w, Height: h, Record: cfg, Matrix: 1, Deep: d.deep}
+		if d.dec.(Restarter).Restart(c) {
+			t.Errorf("a decoder went on to a stream of the other depth (deep %t)", d.deep)
+		}
+		c.Deep = !d.deep
+		if !d.dec.(Restarter).Restart(c) {
+			t.Errorf("a decoder did not go on to a stream of its own depth (deep %t)", !d.deep)
+		}
+	}
+}
+
 // TestRestart moves a decoder from one stream to another. The session is
 // kept when the new stream starts on an IDR picture, and replaced, without
 // the caller noticing, when it starts anywhere else.

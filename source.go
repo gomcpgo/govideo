@@ -891,6 +891,12 @@ type videoStream struct {
 	// allocate once it is running.
 	raw, bobbed, turned *codec.VideoFrame
 	rawPic              codec.Picture
+
+	// A high dynamic range stream is decoded to pictures of 10 bits, and
+	// tone brings each one shown to the working format on its way to raw,
+	// by way of deep (SPEC §7.1).
+	tone *process.ToneMapper
+	deep *codec.DeepFrame
 }
 
 // maxIdleDecoders is how many decoders of finished clips an export keeps
@@ -907,14 +913,15 @@ const maxIdleDecoders = 4
 type videoDecoders struct {
 	idle    []codec.VideoStreamDecoder // least recently used first
 	frames  []*codec.VideoFrame
-	checked map[string]bool // formats check has found a decoder for
+	deep    []*codec.DeepFrame // the same, for high dynamic range clips
+	checked map[string]bool    // formats check has found a decoder for
 }
 
 // check reports whether the stream cfg describes can be decoded here, by
 // getting a decoder for it, which is then kept for the clip. A format is
 // tried once however many clips have it.
 func (c *videoDecoders) check(cfg oscodec.VideoConfig) error {
-	key := fmt.Sprintf("%s %dx%d %s", cfg.Codec, cfg.Width, cfg.Height, cfg.Record)
+	key := fmt.Sprintf("%s %dx%d %t %s", cfg.Codec, cfg.Width, cfg.Height, cfg.Deep, cfg.Record)
 	if c.checked[key] {
 		return nil
 	}
@@ -972,7 +979,7 @@ func (c *videoDecoders) close() {
 	for _, d := range c.idle {
 		d.Close()
 	}
-	c.idle, c.frames = nil, nil
+	c.idle, c.frames, c.deep = nil, nil, nil
 }
 
 // openVideo starts reading stream s of m; the first frame asked for will be
@@ -1021,6 +1028,16 @@ func openVideo(ctx context.Context, m *media, s *videoprobe.Stream, start, slack
 	// does not always pass it on with the pictures.
 	matrix := map[string]int{"bt709": 1, "bt470bg": 5, "smpte170m": 6, "smpte240m": 7, "bt2020nc": 9, "bt2020c": 10}[s.Video.ColorMatrix]
 	v.cfg = oscodec.VideoConfig{Codec: string(ci.ID), Width: w, Height: h, Record: m.config(s, box), Matrix: matrix}
+	if hdr := hdrSignal(s.Video); hdr.Transfer != 0 {
+		// The decoder is asked for its 10 bits. The change of primaries
+		// and the upper half of the PQ curve spread the steps of the
+		// signal, and from the 8 bits the decoder gives otherwise that
+		// shows as bands.
+		if v.tone, err = process.NewToneMapper(hdr); err != nil {
+			return nil, fmt.Errorf("%s: %w", m.path, err)
+		}
+		v.cfg.Deep = true
+	}
 	if err := decs.check(v.cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", m.path, err)
 	}
@@ -1060,7 +1077,26 @@ func (v *videoStream) close() {
 			v.decs.frames = append(v.decs.frames, f)
 		}
 	}
-	v.raw, v.bobbed, v.turned = nil, nil, nil
+	if v.deep != nil {
+		v.decs.deep = append(v.decs.deep, v.deep)
+	}
+	v.raw, v.bobbed, v.turned, v.deep = nil, nil, nil, nil
+}
+
+// hdrSignal returns what the tone mapping of a stream needs to know of its
+// signal; the Transfer is zero for a stream of standard dynamic range.
+func hdrSignal(vi *videoprobe.VideoInfo) process.HDR {
+	var hdr process.HDR
+	switch vi.HDR {
+	case "hlg":
+		hdr.Transfer = process.TransferHLG
+	case "pq":
+		hdr.Transfer = process.TransferPQ
+	default:
+		return hdr
+	}
+	hdr.Primaries = map[string]int{"bt709": 1, "bt2020": 9, "smpte432": 12}[vi.ColorPrimaries]
+	return hdr
 }
 
 // drop gives the picture of a frame that will not be shown again back to
@@ -1306,7 +1342,7 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 					v.raw = v.decs.frame()
 				}
 				v.rawPic = nil
-				if v.raw, err = c.pic.Frame(v.raw); err != nil {
+				if v.raw, err = v.copyOut(c.pic); err != nil {
 					return nil, 0, err
 				}
 				v.rawPic = c.pic
@@ -1342,6 +1378,27 @@ func (v *videoStream) frameAt(t time.Duration) (*codec.VideoFrame, int64, error)
 		v.shown, v.shownSeq = f, v.seq
 	}
 	return v.shown, v.seq, nil
+}
+
+// copyOut copies a decoded picture out of the decoder into the stream's
+// frame for it, which it returns: a picture of high dynamic range through
+// the tone mapping, so that what leaves here is always the working format's
+// range.
+func (v *videoStream) copyOut(pic codec.Picture) (*codec.VideoFrame, error) {
+	dp, ok := pic.(codec.DeepPicture)
+	if v.tone == nil || !ok {
+		return pic.Frame(v.raw)
+	}
+	if v.deep == nil {
+		if n := len(v.decs.deep); n > 0 {
+			v.deep, v.decs.deep = v.decs.deep[n-1], v.decs.deep[:n-1]
+		}
+	}
+	var err error
+	if v.deep, err = dp.DeepFrame(v.deep); err != nil {
+		return nil, err
+	}
+	return v.tone.Map(v.raw, v.deep), nil
 }
 
 // decodeStill loads a still image as a frame, honouring EXIF orientation.

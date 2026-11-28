@@ -51,6 +51,46 @@ func (f *VideoFrame) Reuse(w, h int) *VideoFrame {
 // ChromaSize returns the dimensions of the chroma planes.
 func (f *VideoFrame) ChromaSize() (w, h int) { return (f.Width + 1) / 2, (f.Height + 1) / 2 }
 
+// DeepFrame is a planar YUV 4:2:0 picture with samples of more than 8 bits,
+// as a decoder gives it for a 10-bit stream. It is not a working format:
+// the pipeline has it only between the decoder and the step that brings a
+// high dynamic range picture to the working format (SPEC §7.1), which needs
+// the bits a VideoFrame has dropped.
+//
+// A sample fills its 16 bits from the top, as P010 stores it: a 10-bit value
+// v is held as v<<6. Black and white of a limited-range picture are then
+// 4096 and 60160 whatever the depth, and a chroma sample of no colour is
+// 32768. A sample is read as all 16 bits: the bits below the depth are zero
+// from a stream of that depth, and a decoder that widens a shallower stream
+// may fill them.
+type DeepFrame struct {
+	Width, Height int
+	Y, Cb, Cr     []uint16
+	YStride       int
+	CStride       int
+	// Depth is the number of bits of a sample that mean something.
+	Depth int
+	// Matrix is the H.273 matrix coefficient code (9 = BT.2020).
+	Matrix int
+	// FullRange reports full-range rather than limited-range samples.
+	FullRange bool
+}
+
+// Reuse returns a w×h deep frame to write a picture into, as
+// VideoFrame.Reuse does: f itself when its planes are large enough, else a
+// new one (f may be nil). The contents are unspecified and the tags are
+// those of 10-bit BT.2020, limited range.
+func (f *DeepFrame) Reuse(w, h int) *DeepFrame {
+	cw, ch := (w+1)/2, (h+1)/2
+	if f == nil || cap(f.Y) < w*h || cap(f.Cb) < cw*ch || cap(f.Cr) < cw*ch {
+		f = &DeepFrame{Y: make([]uint16, w*h), Cb: make([]uint16, cw*ch), Cr: make([]uint16, cw*ch)}
+	}
+	f.Width, f.Height, f.YStride, f.CStride = w, h, w, cw
+	f.Y, f.Cb, f.Cr = f.Y[:w*h], f.Cb[:cw*ch], f.Cr[:cw*ch]
+	f.Depth, f.Matrix, f.FullRange = 10, 9, false
+	return f
+}
+
 // AudioFrame is a block of interleaved float32 PCM in the range [-1, 1].
 type AudioFrame struct {
 	SampleRate int

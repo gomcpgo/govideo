@@ -35,8 +35,10 @@ const maxFrameSide = 16384
 //
 // The video is decoded from the last sync sample before the time asked for,
 // so the cost does not grow with the position in the file. Interlaced
-// H.264 gives one field of the frame, deinterlaced. A file whose codec has
-// no decoder on this host is refused with an *ErrCodecUnavailable.
+// H.264 gives one field of the frame, deinterlaced, and a high dynamic
+// range video (HLG, PQ) is tone-mapped to the standard range. A file whose
+// codec has no decoder on this host is refused with an
+// *ErrCodecUnavailable.
 func Frame(ctx context.Context, path string, o FrameOptions) (image.Image, error) {
 	if o.At < 0 {
 		return nil, errors.New("govideo: FrameOptions.At must not be negative")

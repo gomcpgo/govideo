@@ -31,6 +31,12 @@ type VideoConfig struct {
 	// or container (1 = BT.709, 5 or 6 = BT.601, 9 = BT.2020). 0 leaves it
 	// to the decoder, which may not know either.
 	Matrix int
+	// Deep asks for pictures with all the bits of a stream of more than 8:
+	// each is then a codec.DeepPicture, and DeepFrame gives its 10-bit
+	// samples. Frame still gives 8. It is for high dynamic range streams,
+	// whose tone mapping needs the bits; without it the system reduces every
+	// picture to 8 bits itself.
+	Deep bool
 }
 
 // Restarter is a video decoder that can go on to decode another stream
